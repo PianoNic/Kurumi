@@ -1,0 +1,39 @@
+name: validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Validate compose file
+        run: docker compose config --quiet
+
+      - name: Check MCP server syntax
+        run: node --check src/index.js
+
+      - name: Check Kurumi bot syntax
+        run: node --check kurumi-chat-bot/src/index.js
+
+      - name: Type-check agent-sdk
+        working-directory: agent-sdk
+        run: |
+          npm ci
+          npx tsc --noEmit
+
+      - name: Guard against committed .env files
+        run: |
+          if git ls-files | grep -E '(^|/)\.env$'; then
+            echo "::error::A .env file is tracked in the repo. Add it to .gitignore and remove from history."
+            exit 1
+          fi

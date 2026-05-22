@@ -1,0 +1,23 @@
+{
+  "name": "discord-server-bot-mcp",
+  "version": "0.1.0",
+  "description": "MCP server that lets Claude Code set up Discord servers (channels, roles, permissions, guild settings).",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "discord-server-bot-mcp": "src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "list-guilds": "node src/list-guilds.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "discord.js": "^14.26.2",
+    "dotenv": "^16.4.5",
+    "zod": "^3.23.8"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

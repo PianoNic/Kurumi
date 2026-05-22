@@ -1,0 +1,12 @@
+node_modules
+npm-debug.log
+.env
+.env.*
+*.log
+.git
+.gitignore
+.mcp.json
+README.md
+agent-sdk
+kurumi-chat-bot
+kurumi-workspace

@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "discord-server-bot": {
+      "command": "docker",
+      "args": [
+        "run",
+        "--rm",
+        "-i",
+        "--env-file",
+        "C:\\Coding\\KurumiStack\\.env",
+        "discord-server-bot:latest"
+      ]
+    }
+  }
+}

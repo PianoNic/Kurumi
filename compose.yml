@@ -1,0 +1,94 @@
+# Top-level orchestrator for all three projects in the KurumiStack repo.
+#
+# Services:
+#   discord-server-bot  — MCP server (stdio). Built as an image; Claude Code
+#                         invokes it via `docker run -i` (see .mcp.json), NOT
+#                         via `docker compose up`. The compose service entry
+#                         exists so `docker compose build discord-server-bot`
+#                         produces the image used by .mcp.json.
+#   kurumi-chat-bot     — long-running Discord chat bot that spawns `claude` CLI.
+#   agent-sdk-login     — one-shot interactive Claude Code shell for `/login`.
+#   agent-sdk           — one-shot Agent SDK hello-world.
+#
+# Shared volumes:
+#   claude-config  — /root/.claude OAuth credentials. ONE login covers both the
+#                    chat bot's `claude` subprocess calls and the agent-sdk run.
+#   kurumi-state   — persists kurumi-chat-bot/sessions.json across restarts.
+#
+# IMPORTANT: ANTHROPIC_API_KEY is NOT forwarded to any service. If it's set on
+# your host shell it stays on the host. The Agent SDK service also asserts it.
+
+# Explicit project name so volume names are deterministic regardless of the
+# folder the repo is cloned into. Resulting volumes: `kurumistack_claude-config`,
+# `kurumistack_kurumi-state`.
+name: kurumistack
+
+services:
+  discord-server-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: discord-server-bot:latest
+    # No `command:` override — uses the Dockerfile CMD (node src/index.js).
+    # No `ports:` — this service speaks JSON-RPC on stdio.
+    # Not started by `docker compose up`; invoked by Claude Code via .mcp.json.
+    profiles: ["build-only"]
+
+  kurumi-chat-bot:
+    build:
+      context: ./kurumi-chat-bot
+      dockerfile: Dockerfile
+      # Make the repo root available as a named build context so the chat bot
+      # image can embed the discord-server-bot MCP server sources (see its
+      # Dockerfile: COPY --from=mcp-src ...).
+      additional_contexts:
+        mcp-src: .
+    image: kurumi-chat-bot:latest
+    container_name: kurumi-chat-bot
+    restart: unless-stopped
+    env_file:
+      # Only the Kurumi token. The embedded MCP server falls back to
+      # KURUMI_BOT_TOKEN when DISCORD_BOT_TOKEN isn't set, so the whole stack
+      # uses a single Discord application identity (KURUMI). The legacy
+      # ./.env / DISCORD_BOT_TOKEN is intentionally NOT mounted here.
+      - path: ./kurumi-chat-bot/.env
+        required: false
+    environment:
+      KURUMI_WORKSPACE: /workspace
+      KURUMI_SESSIONS_FILE: /state/sessions.json
+      CLAUDE_BIN: claude
+      # Claude Code refuses to run as root unless IS_SANDBOX=1 is set. Containers
+      # run as root by default, so flip the flag.
+      IS_SANDBOX: "1"
+    volumes:
+      - claude-config:/root/.claude
+      - ./kurumi-workspace:/workspace
+      - kurumi-state:/state
+
+  agent-sdk:
+    build:
+      context: ./agent-sdk
+      dockerfile: Dockerfile
+    image: agent-sdk:latest
+    container_name: agent-sdk
+    profiles: ["agent"]
+    command: ["npm", "run", "agent"]
+    volumes:
+      - claude-config:/root/.claude
+      - ./agent-sdk/src:/app/src:ro
+
+  # Same image as `agent-sdk`, different command. No `build:` here — relies on
+  # the `agent-sdk` service to produce the image (run `--profile agent build` first).
+  agent-sdk-login:
+    image: agent-sdk:latest
+    container_name: agent-sdk-login
+    profiles: ["login"]
+    stdin_open: true
+    tty: true
+    command: ["claude"]
+    volumes:
+      - claude-config:/root/.claude
+
+volumes:
+  claude-config:
+  kurumi-state:

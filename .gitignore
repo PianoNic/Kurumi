@@ -1,0 +1,41 @@
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Build output
+**/dist/
+**/build/
+
+# Secrets — never commit any of these
+.env
+.env.local
+.env.*.local
+**/.env
+!**/.env.example
+
+# Logs
+*.log
+npm-debug.log*
+
+# Kurumi chat bot runtime workspace — keep the folder, drop its contents.
+# Claude Code reads/writes here at runtime; nothing in here should be tracked.
+kurumi-workspace/*
+!kurumi-workspace/.gitkeep
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Smoke-test artifacts (used for ad-hoc MCP testing)
+mcp-smoke.*
+
+# Local Claude Code session state, if any
+.claude/

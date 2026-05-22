@@ -1,0 +1,19 @@
+{
+  "name": "agent-sdk",
+  "version": "0.1.0",
+  "description": "Claude Agent SDK minimal example, authenticated via Claude Max subscription (OAuth).",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "agent": "tsx src/agent.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "latest"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3",
+    "@types/node": "^22.10.2"
+  },
+  "engines": { "node": ">=20" }
+}

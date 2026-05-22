@@ -1,0 +1,15 @@
+{
+  "name": "kurumi-chat-bot",
+  "version": "0.1.0",
+  "description": "Discord <-> Claude Code (Haiku) bridge for the KURUMI server.",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.26.2",
+    "dotenv": "^16.4.5"
+  },
+  "engines": { "node": ">=18" }
+}
