@@ -54,20 +54,10 @@ function daysUntilBirthday(dateStr) {
   const msPerDay = 24 * 60 * 60 * 1000;
   return Math.ceil((nextBirthday - today) / msPerDay);
 }
-const argsJson = process.argv[2];
-let cmd = '', userId = '', date = '';
-if (argsJson) {
-  try {
-    const args = JSON.parse(argsJson);
-    cmd = args.action || args.cmd || '';
-    userId = args.userid || '';
-    date = args.date || '';
-  } catch {
-    cmd = argsJson;
-    userId = process.argv[3] || '';
-    date = process.argv[4] || '';
-  }
-}
+const args = JSON.parse(process.argv[2] || '{}');
+const cmd = args.action || args.cmd || '';
+const userId = args.userid || '';
+const date = args.date || '';
 if (cmd === 'add' && userId && date) {
   addBirthday(userId, date);
   console.log(`Added birthday for ${userId}: ${date}`);
@@ -91,5 +81,5 @@ if (cmd === 'add' && userId && date) {
     console.log('No birthdays tracked.');
   }
 } else {
-  console.log('Usage: birthday-reminder.js [add|remove|today|list] [userid] [YYYY-MM-DD]');
+  console.log('Usage: /birthday [add|remove|today|list] [userid] [date]');
 }

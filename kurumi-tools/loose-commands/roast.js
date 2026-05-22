@@ -38,14 +38,6 @@ function generateRoastFor(name) {
   if (!name) return roast;
   return roast.replace(/you/gi, (match) => match === 'you' ? name : name.toUpperCase());
 }
-const argsJson = process.argv[2];
-let target = '';
-if (argsJson) {
-  try {
-    const args = JSON.parse(argsJson);
-    target = args.target || '';
-  } catch {
-    target = argsJson;
-  }
-}
+const args = JSON.parse(process.argv[2] || '{}');
+const target = args.target || '';
 console.log(generateRoastFor(target));

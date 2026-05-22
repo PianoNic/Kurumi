@@ -25,16 +25,8 @@ function getRandomPoll() {
 function getPollsByCategory(category) {
   return polls.filter(poll => poll.category === category);
 }
-const argsJson = process.argv[2];
-let category = null;
-if (argsJson) {
-  try {
-    const args = JSON.parse(argsJson);
-    category = args.category || null;
-  } catch {
-    category = argsJson || null;
-  }
-}
+const args = JSON.parse(process.argv[2] || '{}');
+const category = args.category || null;
 const poll = category ? (getPollsByCategory(category)[0] || getRandomPoll()) : getRandomPoll();
 console.log(poll.question);
 poll.options.forEach((option, i) => {
