@@ -16,6 +16,8 @@ const NOTES_FILE = resolve(process.env.KURUMI_NOTES_FILE ?? "/state/kurumi-notes
 const ATTACHMENT_DIR = resolve(process.env.KURUMI_ATTACHMENT_DIR ?? "/state/attachments");
 const GIF_INDEX_FILE = resolve(process.env.KURUMI_GIF_INDEX ?? "/state/gif-library/index.json");
 const GIF_LIBRARY_DIR = resolve(process.env.KURUMI_GIF_LIBRARY ?? "/state/gif-library");
+const LOOSE_TOOLS_DIR = resolve(process.env.KURUMI_LOOSE_TOOLS ?? "/kurumi-tools/loose");
+const SLASH_COMMANDS_FILE = resolve(process.env.KURUMI_SLASH_COMMANDS_FILE ?? "/state/slash-commands.json");
 const HISTORY_LINES = Number(process.env.KURUMI_HISTORY_LINES ?? 10);
 
 const IMAGE_CT_RE = /^image\/(png|jpe?g|gif|webp|bmp)$/i;
@@ -261,6 +263,8 @@ That's it. One paragraph. No further tool calls until you get an answer. Scope d
 
 **LOOSE TOOLS — extending yourself without a rebuild.** You have four MCP tools for authoring callable tools on the fly: \`loose_tool_create(name, description, interpreter, code, argsHint?)\` writes a script to \`/kurumi-tools/loose/<name>.<sh|js>\` and registers metadata in \`/kurumi-tools/loose/index.json\`. \`loose_tool_list()\` shows what you have. \`loose_tool_run({name, args})\` executes a registered tool — args are JSON-encoded and arrive as \`argv[2]\` (parse with \`JSON.parse(process.argv[2] || "{}")\` in node or \`jq -r '.foo' <<< "$1"\` in bash); stdout becomes the result; 30s timeout; 16 KB output cap. \`loose_tool_remove(name)\` deletes one. This is for legitimate self-extension (a recurring API caller, a custom formatter, a niche wrapper) — NOT for bypassing scope rules. Every limit above still applies inside the script.
 
+**SLASH COMMANDS — exposing loose tools to users.** Once you have a loose tool, you can expose it as a real Discord slash command at runtime — no restart. \`slash_command_register({name, description, looseToolName, guildId?, options?})\` calls Discord's REST API and persists the mapping to \`/state/slash-commands.json\`. **Pass \`guildId\` for instant visibility** — global commands take up to 1 hour to propagate. \`options\` is an array like \`[{name:"target", description:"who to roast", type:"user", required:true}]\` — supported types: string, integer, number, boolean, user, channel, role. When invoked, the user's option values + injected metadata (\`__invokedBy\`, \`__invokedByTag\`, \`__channelId\`, \`__guildId\`) are JSON-encoded and handed to your loose tool as argv[2]; the tool's stdout becomes the reply. \`slash_command_list()\` shows what's registered; \`slash_command_unregister({name, guildId?})\` removes one. **The typical flow**: \`loose_tool_create\` → \`slash_command_register guildId:<the current guild>\` → user types \`/<name>\` → magic.
+
 **The /kurumi-tools folder is for SMALL, SELF-CONTAINED scripts** — bash one-liners, tiny Node utilities that use libraries already installed, simple curl wrappers. It is NOT for "let me set up a full headless browser stack". If a tool needs anything beyond \`bash\`, \`node\` with already-installed npm packages, \`curl\`, and standard Unix utilities, **that's a Dockerfile change**, not a /kurumi-tools script. Surface it to the owner.
 
 **Pre-installed CLIs in the container:** \`bash\`, \`node\`, \`npm\`, \`git\`, \`curl\`, \`gh\` (GitHub CLI), \`claude\`. Prefer \`gh\` for any GitHub interaction (issues, PRs, releases, repo metadata, gists, workflows) instead of hand-crafting curl + REST calls — \`gh\` is authenticated via \`GH_TOKEN\` if the owner set one. Examples: \`gh repo view owner/repo\`, \`gh issue list -R owner/repo --state open\`, \`gh pr create --title ... --body ...\`, \`gh api /users/foo\`. Don't try to install anything else — see the SCOPE DISCIPLINE section above.
@@ -367,6 +371,93 @@ function enqueueChannelWork(channelId, work) {
   });
   return { accepted: true, queued: entry.depth > 1, position: entry.depth };
 }
+
+// Runtime slash-command dispatch. Mapping ({commandName -> looseToolName})
+// lives in /state/slash-commands.json. Discord-side registration is done via
+// the REST API by the slash_command_register self-MCP tool — no restart
+// needed. This handler just routes the InteractionCreate event into the
+// matching loose tool, collects its stdout, and replies. 30s timeout per
+// command, automatic deferReply if anything takes longer than 2.5s.
+function loadSlashCommandMap() {
+  if (!existsSync(SLASH_COMMANDS_FILE)) return {};
+  try {
+    const parsed = JSON.parse(readFileSync(SLASH_COMMANDS_FILE, "utf8"));
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch { return {}; }
+}
+
+function loadLooseToolsIndex() {
+  const indexPath = resolve(LOOSE_TOOLS_DIR, "index.json");
+  if (!existsSync(indexPath)) return [];
+  try {
+    const arr = JSON.parse(readFileSync(indexPath, "utf8"));
+    return Array.isArray(arr) ? arr : [];
+  } catch { return []; }
+}
+
+async function runLooseToolByName(toolName, args) {
+  const tool = loadLooseToolsIndex().find((t) => t.name === toolName);
+  if (!tool) return { ok: false, output: `loose tool '${toolName}' not found` };
+  if (!existsSync(tool.path)) return { ok: false, output: `loose tool script missing at ${tool.path}` };
+  const payload = JSON.stringify(args ?? {});
+  const cmd = tool.interpreter === "bash" ? "bash" : "node";
+  return await new Promise((resolveCall) => {
+    const child = spawn(cmd, [tool.path, payload], { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "", stderr = "";
+    child.stdout.on("data", (d) => { stdout += d.toString(); if (stdout.length > 16_384) child.kill("SIGKILL"); });
+    child.stderr.on("data", (d) => { stderr += d.toString(); if (stderr.length > 16_384) child.kill("SIGKILL"); });
+    const timer = setTimeout(() => child.kill("SIGKILL"), 30_000);
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolveCall({
+        ok: code === 0,
+        output: code === 0
+          ? (stdout.trim() || "*(no output)*")
+          : `\`/${toolName}\` failed (exit ${code}):\n\`\`\`\n${(stderr || stdout).slice(-1500)}\n\`\`\``,
+      });
+    });
+    child.on("error", (e) => { clearTimeout(timer); resolveCall({ ok: false, output: `spawn error: ${e.message}` }); });
+  });
+}
+
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isChatInputCommand?.()) return;
+  const map = loadSlashCommandMap();
+  const entry = map[interaction.commandName];
+  if (!entry) return;
+  const looseToolName = typeof entry === "string" ? entry : entry.looseToolName;
+  if (!looseToolName) return;
+
+  // Collect every option the user supplied into a flat JSON object. Discord
+  // option types are coerced to JS primitives by discord.js — strings stay
+  // strings, integers stay numbers, users/channels become snowflake strings.
+  const args = {};
+  for (const opt of interaction.options.data) {
+    if (opt.type === 6 /* User */) args[opt.name] = opt.user?.id ?? null;
+    else if (opt.type === 7 /* Channel */) args[opt.name] = opt.channel?.id ?? null;
+    else if (opt.type === 8 /* Role */) args[opt.name] = opt.role?.id ?? null;
+    else args[opt.name] = opt.value;
+  }
+  args.__invokedBy = interaction.user.id;
+  args.__invokedByTag = interaction.user.tag;
+  args.__channelId = interaction.channelId;
+  args.__guildId = interaction.guildId ?? null;
+
+  // Defer if we suspect it'll be slow (Discord drops the interaction at 3s).
+  const deferTimer = setTimeout(() => {
+    interaction.deferReply().catch(() => {});
+  }, 2_500);
+
+  const { ok, output } = await runLooseToolByName(looseToolName, args);
+  clearTimeout(deferTimer);
+  const reply = output.slice(0, 1900);
+  try {
+    if (interaction.deferred) await interaction.editReply(reply);
+    else await interaction.reply({ content: reply, ephemeral: !ok });
+  } catch (e) {
+    console.error(`[slash] /${interaction.commandName} reply failed:`, e.message);
+  }
+});
 
 client.on(Events.MessageCreate, async (msg) => {
   const cfg = loadRuntimeConfig();
@@ -707,10 +798,18 @@ function buildMcpConfigJson({ isOwner, isAdmin }) {
   // founders get operational tools only (mute_channel, auto-respond,
   // notes, read-only config).
   if (isAdmin) {
+    // App ID is the first segment of the bot token (base64-decoded). Derive
+    // it on the fly so the owner doesn't have to put it in .env separately.
+    let appId = "";
+    try { appId = Buffer.from(TOKEN.split(".")[0], "base64").toString("utf8"); } catch { /* ignore */ }
     servers["kurumi-self"] = {
       command: "node",
       args: [resolve(import.meta.dirname, "self-mcp.js")],
-      env: { KURUMI_MCP_TIER: isOwner ? "admin" : "self" },
+      env: {
+        KURUMI_MCP_TIER: isOwner ? "admin" : "self",
+        KURUMI_BOT_TOKEN: TOKEN,
+        KURUMI_APPLICATION_ID: appId,
+      },
     };
   }
   return JSON.stringify({ mcpServers: servers });
