@@ -309,6 +309,7 @@ client.once(Events.ClientReady, async (c) => {
       console.warn(`  ↳ could not fetch members of "${guild.name}": ${e.message} (enable Server Members Intent in Dev Portal?)`);
     }
   }
+  await announceReturnIfNeeded();
 });
 
 // Per-channel work queue. Different channels run in parallel (separate
@@ -895,13 +896,58 @@ function buildContextBlock({ msg, isAdmin, isOwner, founderRoster, cfg, recentHi
 
 // Track which channels Kurumi has recently engaged with so we can post a
 // graceful goodbye when the container is shutting down (compose down,
-// docker stop, rebuild, etc.).
+// docker stop, rebuild, etc.) AND announce her return on the next boot.
 const recentlyActiveChannels = new Map(); // channelId -> { channel, lastAt }
 const RECENT_CHANNEL_WINDOW_MS = 30 * 60 * 1000;
+const ACTIVE_CHANNELS_FILE = resolve(process.env.KURUMI_ACTIVE_CHANNELS_FILE ?? "/state/active-channels.json");
+// Restart-announcement throttle. If the container is rebuilt 8 times in a
+// minute (which is what's been happening during active development), we do
+// NOT want to spam every channel with eight goodbye/hello pairs. Skip the
+// announcement when the previous boot was less than this many ms ago.
+const RESTART_ANNOUNCE_COOLDOWN_MS = 90_000;
 
 function markChannelActive(channel) {
   if (!channel) return;
   recentlyActiveChannels.set(channel.id, { channel, lastAt: Date.now() });
+}
+
+function persistActiveChannels(extra = {}) {
+  const cutoff = Date.now() - RECENT_CHANNEL_WINDOW_MS;
+  const channels = [...recentlyActiveChannels.values()]
+    .filter((c) => c.lastAt >= cutoff)
+    .map(({ channel, lastAt }) => ({ id: channel.id, lastAt }));
+  try {
+    mkdirSync(resolve(ACTIVE_CHANNELS_FILE, ".."), { recursive: true });
+    writeFileSync(ACTIVE_CHANNELS_FILE, JSON.stringify({ channels, ...extra }, null, 2));
+  } catch (e) { console.error("[kurumi] could not persist active-channels:", e.message); }
+}
+
+function readActiveChannels() {
+  if (!existsSync(ACTIVE_CHANNELS_FILE)) return { channels: [] };
+  try { return JSON.parse(readFileSync(ACTIVE_CHANNELS_FILE, "utf8")); }
+  catch { return { channels: [] }; }
+}
+
+async function announceReturnIfNeeded() {
+  const state = readActiveChannels();
+  if (!state.shutDownAt) return;
+  const downFor = Date.now() - state.shutDownAt;
+  if (downFor < RESTART_ANNOUNCE_COOLDOWN_MS) {
+    console.error(`[kurumi] back online after only ${Math.round(downFor / 1000)}s — skipping return announcement (rebuild churn)`);
+    persistActiveChannels({ shutDownAt: null });
+    return;
+  }
+  const cutoff = Date.now() - RECENT_CHANNEL_WINDOW_MS;
+  const fresh = (state.channels ?? []).filter((c) => c.lastAt >= cutoff);
+  if (!fresh.length) return;
+  console.error(`[kurumi] announcing return to ${fresh.length} previously-active channel(s) (down ${Math.round(downFor / 1000)}s)`);
+  await Promise.allSettled(fresh.map(async ({ id }) => {
+    try {
+      const ch = await client.channels.fetch(id);
+      if (ch?.isTextBased?.()) await ch.send("*…back. the clock resumes its tick.*");
+    } catch { /* channel deleted or no perms — silently skip */ }
+  }));
+  persistActiveChannels({ shutDownAt: null });
 }
 
 let shuttingDown = false;
@@ -911,14 +957,25 @@ async function gracefulShutdown(signal) {
   console.error(`[kurumi] received ${signal} — posting goodbye to active channels…`);
   const cutoff = Date.now() - RECENT_CHANNEL_WINDOW_MS;
   const targets = [...recentlyActiveChannels.values()].filter((c) => c.lastAt >= cutoff);
-  await Promise.allSettled(
-    targets.map(({ channel }) =>
-      channel.send("*the clock ticks down — i'm being restarted. back in a moment.*").catch(() => {})
-    )
-  );
+  // Check whether we *just* started — if so, the goodbye is rebuild-churn
+  // noise. Skip the public message, just persist state and exit quietly.
+  const bootedAgoMs = Date.now() - bootedAt;
+  const announce = bootedAgoMs >= RESTART_ANNOUNCE_COOLDOWN_MS;
+  if (announce) {
+    await Promise.allSettled(
+      targets.map(({ channel }) =>
+        channel.send("*the clock ticks down — i'm being restarted. back in a moment.*").catch(() => {})
+      )
+    );
+  } else {
+    console.error(`[kurumi] booted ${Math.round(bootedAgoMs / 1000)}s ago — suppressing goodbye message (rebuild churn)`);
+  }
+  persistActiveChannels({ shutDownAt: Date.now() });
   try { client.destroy(); } catch { /* ignore */ }
   process.exit(0);
 }
+
+const bootedAt = Date.now();
 
 client.on("error", (e) => console.error("[kurumi] client error:", e));
 client.on("shardError", (e) => console.error("[kurumi] shard error:", e));
