@@ -1,0 +1,50 @@
+[
+  {
+    "name": "birthday-reminder",
+    "description": "Birthday tracker — store user birthdays, check today's celebrations, list upcoming with days remaining.",
+    "interpreter": "node",
+    "argsHint": "{cmd: \"add\"|\"remove\"|\"today\"|\"list\", userId?: string, date?: \"YYYY-MM-DD\"}",
+    "path": "/kurumi-tools/loose/birthday-reminder.js",
+    "createdAt": "2026-05-22T15:50:47.290Z"
+  },
+  {
+    "name": "roast-generator",
+    "description": "Roast generator — 27 playful, edgy comebacks that work standalone or targeted at a name.",
+    "interpreter": "node",
+    "argsHint": "{name?: string}",
+    "path": "/kurumi-tools/loose/roast-generator.js",
+    "createdAt": "2026-05-22T15:50:54.906Z"
+  },
+  {
+    "name": "madlibs",
+    "description": "Mad libs game — fill-in-the-blank word templates that create absurd, hilarious stories.",
+    "interpreter": "node",
+    "argsHint": "{action?: \"template\"}",
+    "path": "/kurumi-tools/loose/madlibs.js",
+    "createdAt": "2026-05-22T15:51:02.414Z"
+  },
+  {
+    "name": "niche-poll",
+    "description": "Niche poll generator — 18 absurdly specific, pointless, hilarious poll questions for Discord engagement.",
+    "interpreter": "node",
+    "argsHint": "{category?: string}",
+    "path": "/kurumi-tools/loose/niche-poll.js",
+    "createdAt": "2026-05-22T15:51:12.778Z"
+  },
+  {
+    "name": "song-lyric-game",
+    "description": "Song lyric guessing game — recognize iconic songs from blanked lyrics.",
+    "interpreter": "node",
+    "argsHint": "{action?: \"prompt\"}",
+    "path": "/kurumi-tools/loose/song-lyric-game.js",
+    "createdAt": "2026-05-22T15:51:23.757Z"
+  },
+  {
+    "name": "weirdly-specific-fact",
+    "description": "Weirdly specific fact generator — 35 obscure, oddly precise facts that range from biology to history.",
+    "interpreter": "node",
+    "argsHint": "{action?: \"random\"}",
+    "path": "/kurumi-tools/loose/weirdly-specific-fact.js",
+    "createdAt": "2026-05-22T15:51:33.960Z"
+  }
+]

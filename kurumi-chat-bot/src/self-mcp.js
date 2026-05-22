@@ -21,6 +21,9 @@ const CONFIG_FILE = resolve(process.env.KURUMI_CONFIG_FILE ?? "/state/kurumi-con
 const NOTES_FILE = resolve(process.env.KURUMI_NOTES_FILE ?? "/state/kurumi-notes.json");
 const GIF_INDEX_FILE = resolve(process.env.KURUMI_GIF_INDEX ?? "/state/gif-library/index.json");
 const GIF_LIBRARY_DIR = resolve(process.env.KURUMI_GIF_LIBRARY ?? "/state/gif-library");
+const LOOSE_TOOLS_DIR = resolve(process.env.KURUMI_LOOSE_TOOLS ?? "/kurumi-tools/loose");
+const LOOSE_TOOLS_INDEX = resolve(LOOSE_TOOLS_DIR, "index.json");
+const LOOSE_TOOL_NAME_RE = /^[a-z][a-z0-9_-]{0,40}$/i;
 
 // Tier set per-spawn by the bot via the MCP server's env block:
 //   "admin" — owner. Everything: read + write config, mute users, reset, etc.
@@ -45,6 +48,10 @@ const SELF_TOOL_NAMES = new Set([
   "gif_list",
   "gif_search",
   "gif_remove",
+  "loose_tool_create",
+  "loose_tool_list",
+  "loose_tool_run",
+  "loose_tool_remove",
 ]);
 
 // Scope shape: "global" | "guild:<id>" | "channel:<id>" | "user:<id>".
@@ -83,6 +90,19 @@ function loadGifIndex() {
 function saveGifIndex(index) {
   mkdirSync(GIF_LIBRARY_DIR, { recursive: true });
   writeFileSync(GIF_INDEX_FILE, JSON.stringify(index, null, 2));
+}
+
+function loadLooseTools() {
+  if (!existsSync(LOOSE_TOOLS_INDEX)) return [];
+  try {
+    const arr = JSON.parse(readFileSync(LOOSE_TOOLS_INDEX, "utf8"));
+    return Array.isArray(arr) ? arr : [];
+  } catch { return []; }
+}
+
+function saveLooseTools(tools) {
+  mkdirSync(LOOSE_TOOLS_DIR, { recursive: true });
+  writeFileSync(LOOSE_TOOLS_INDEX, JSON.stringify(tools, null, 2));
 }
 
 // Settable keys with their schemas and human descriptions. Any key not in
@@ -474,6 +494,70 @@ const ALL_TOOLS = [
         additionalProperties: false,
       },
     },
+    {
+      name: "loose_tool_create",
+      description:
+        "Author a NEW loose tool on the fly: a small executable script stored in /kurumi-tools/loose/<name>.<ext> with metadata in /kurumi-tools/loose/index.json. Once registered, invoke it via loose_tool_run — no container restart, no MCP refresh needed. Use this when you want to extend yourself: a one-off scraper, a recurring API caller, a custom formatter, a wrapper around an existing CLI. The script gets the tool args as a single JSON string on argv[2] (interpreter-agnostic). Stdout becomes the tool result; non-zero exit becomes an error. **DO NOT** use this to bypass scope discipline — no installing system packages, no downloading binaries, no calling Discord REST directly with the bot token.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          name: {
+            type: "string",
+            description: "Tool name, [a-z][a-z0-9_-]{0,40}. Lowercase, slug style. Examples: 'fetch-joke', 'count-emojis', 'whois-tld'.",
+          },
+          description: {
+            type: "string",
+            description: "One-sentence description of what the tool does and when to use it. Future-you will read this to decide whether to call the tool.",
+          },
+          interpreter: {
+            type: "string",
+            enum: ["bash", "node"],
+            description: "How to invoke the script: 'bash' (script saved as .sh) or 'node' (script saved as .js).",
+          },
+          code: {
+            type: "string",
+            description: "The complete script source. For 'bash', the first line is auto-set to '#!/bin/bash\\nset -e'. For 'node', it's '#!/usr/bin/env node'. The tool's JSON args arrive as argv[2] / process.argv[2] — parse with `jq -r '.foo' <<< \"$1\"` (bash) or `JSON.parse(process.argv[2] || '{}')` (node).",
+          },
+          argsHint: {
+            type: "string",
+            description: "Free-form hint to future-you about what JSON shape to pass as args. Examples: '{topic: string}' or '{count?: number, format?: \"json\"|\"text\"}'.",
+          },
+        },
+        required: ["name", "description", "interpreter", "code"],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "loose_tool_list",
+      description: "List every registered loose tool with name, description, interpreter, path, and argsHint. Read this before authoring new ones to avoid duplicates.",
+      inputSchema: { type: "object", additionalProperties: false },
+    },
+    {
+      name: "loose_tool_run",
+      description:
+        "Execute a registered loose tool by name with optional JSON args. Returns the script's stdout (capped at 16 KB) on success, the stderr + exit code on failure. 30-second hard timeout per invocation. Use this to call any tool you previously registered via loose_tool_create — and only those tools (it cannot run arbitrary paths).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Registered loose tool name." },
+          args: {
+            description: "Optional JSON-serializable args, passed to the script as argv[2] (a single JSON-encoded string).",
+          },
+        },
+        required: ["name"],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "loose_tool_remove",
+      description: "Permanently delete a loose tool (script file + index entry) by name.",
+      inputSchema: {
+        type: "object",
+        properties: { name: { type: "string" } },
+        required: ["name"],
+        additionalProperties: false,
+      },
+    },
 ];
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
@@ -794,6 +878,92 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     try { rmSync(entry.path, { force: true }); } catch { /* ignore */ }
     saveGifIndex(before.filter((g) => g.id !== id));
     return { content: [{ type: "text", text: `ok — removed ${id}` }] };
+  }
+
+  if (name === "loose_tool_create") {
+    const toolName = String(args?.name ?? "").trim();
+    const description = String(args?.description ?? "").trim();
+    const interpreter = String(args?.interpreter ?? "").trim();
+    const code = String(args?.code ?? "");
+    const argsHint = args?.argsHint ? String(args.argsHint) : "";
+    if (!LOOSE_TOOL_NAME_RE.test(toolName)) {
+      return { content: [{ type: "text", text: "name must match [a-z][a-z0-9_-]{0,40}" }], isError: true };
+    }
+    if (!description || !code) {
+      return { content: [{ type: "text", text: "description and code are required" }], isError: true };
+    }
+    if (interpreter !== "bash" && interpreter !== "node") {
+      return { content: [{ type: "text", text: "interpreter must be 'bash' or 'node'" }], isError: true };
+    }
+    const existing = loadLooseTools();
+    if (existing.some((t) => t.name === toolName)) {
+      return { content: [{ type: "text", text: `loose tool '${toolName}' already exists — remove it first` }], isError: true };
+    }
+    const ext = interpreter === "bash" ? "sh" : "js";
+    const shebang = interpreter === "bash" ? "#!/bin/bash\nset -e\n" : "#!/usr/bin/env node\n";
+    const scriptPath = resolve(LOOSE_TOOLS_DIR, `${toolName}.${ext}`);
+    mkdirSync(LOOSE_TOOLS_DIR, { recursive: true });
+    const finalCode = code.startsWith("#!") ? code : shebang + code;
+    writeFileSync(scriptPath, finalCode, { mode: 0o755 });
+    existing.push({
+      name: toolName, description, interpreter, argsHint,
+      path: scriptPath, createdAt: new Date().toISOString(),
+    });
+    saveLooseTools(existing);
+    return { content: [{ type: "text", text: `ok — registered loose tool '${toolName}' at ${scriptPath}. Invoke with loose_tool_run({name: "${toolName}", args: ...})` }] };
+  }
+
+  if (name === "loose_tool_list") {
+    return { content: [{ type: "text", text: JSON.stringify(loadLooseTools(), null, 2) }] };
+  }
+
+  if (name === "loose_tool_run") {
+    const toolName = String(args?.name ?? "").trim();
+    const tools = loadLooseTools();
+    const tool = tools.find((t) => t.name === toolName);
+    if (!tool) {
+      return { content: [{ type: "text", text: `no loose tool named '${toolName}' — list with loose_tool_list` }], isError: true };
+    }
+    if (!existsSync(tool.path)) {
+      return { content: [{ type: "text", text: `loose tool script missing at ${tool.path} — index is stale` }], isError: true };
+    }
+    const payload = args?.args !== undefined ? JSON.stringify(args.args) : "{}";
+    const { spawn } = await import("node:child_process");
+    const cmd = tool.interpreter === "bash" ? "bash" : "node";
+    return await new Promise((resolveCall) => {
+      const child = spawn(cmd, [tool.path, payload], { stdio: ["ignore", "pipe", "pipe"] });
+      let stdout = "", stderr = "";
+      child.stdout.on("data", (d) => { stdout += d.toString(); if (stdout.length > 16_384) child.kill("SIGKILL"); });
+      child.stderr.on("data", (d) => { stderr += d.toString(); if (stderr.length > 16_384) child.kill("SIGKILL"); });
+      const timer = setTimeout(() => child.kill("SIGKILL"), 30_000);
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        if (code === 0) {
+          return resolveCall({ content: [{ type: "text", text: stdout.slice(0, 16_384) || "(no output)" }] });
+        }
+        resolveCall({
+          content: [{
+            type: "text",
+            text: `exit ${code}\n--- stdout ---\n${stdout.slice(-2000)}\n--- stderr ---\n${stderr.slice(-2000)}`,
+          }],
+          isError: true,
+        });
+      });
+      child.on("error", (e) => {
+        clearTimeout(timer);
+        resolveCall({ content: [{ type: "text", text: `spawn error: ${e.message}` }], isError: true });
+      });
+    });
+  }
+
+  if (name === "loose_tool_remove") {
+    const toolName = String(args?.name ?? "").trim();
+    const before = loadLooseTools();
+    const tool = before.find((t) => t.name === toolName);
+    if (!tool) return { content: [{ type: "text", text: `no loose tool named '${toolName}'` }], isError: true };
+    try { rmSync(tool.path, { force: true }); } catch { /* ignore */ }
+    saveLooseTools(before.filter((t) => t.name !== toolName));
+    return { content: [{ type: "text", text: `ok — removed loose tool '${toolName}'` }] };
   }
 
   if (name === "auto_respond_add") {
