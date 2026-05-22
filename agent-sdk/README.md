@@ -1,6 +1,8 @@
 # agent-sdk
 
-Minimal Claude Agent SDK hello-world, authenticated via your **Claude Max subscription** (OAuth), running entirely in Docker.
+Minimal Claude Agent SDK hello-world, authenticated via your **Claude Max subscription** (OAuth) by default — or via a custom Anthropic-compatible endpoint if you'd rather not depend on the subscription. Runs entirely in Docker.
+
+This service exists to **prove your auth setup works** before you go fight with the full chat bot. If `agent-sdk` prints a greeting and exits 0, `kurumi-chat-bot` will boot.
 
 ## Prerequisites
 
@@ -65,6 +67,17 @@ After running, check **claude.ai → Settings → Usage** (the Claude Code / sub
 | `src/agent.ts` | The minimal SDK call. Asserts `ANTHROPIC_API_KEY` is unset. |
 | `tsconfig.json` | ES2022 / ESM / strict / noEmit (tsx handles execution) |
 | `package.json` | `"type": "module"`, deps, `npm run agent` script |
+
+## Using a custom endpoint instead of OAuth
+
+If you don't have a Claude Max subscription, set in your shell (or in a compose `.env`) before running the agent service:
+
+```powershell
+$env:ANTHROPIC_BASE_URL  = "https://api.z.ai/api/anthropic"
+$env:ANTHROPIC_AUTH_TOKEN = "<your provider token>"
+```
+
+Then skip the `/login` step entirely. `src/agent.ts` accepts either auth path. The bot-side equivalent of this lives in `kurumi-chat-bot/.env` — see [`../DOCKER.md`](../DOCKER.md#using-a-custom-llm-backend-no-oauth).
 
 ## Common footguns
 
