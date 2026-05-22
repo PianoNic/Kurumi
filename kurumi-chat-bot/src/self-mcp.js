@@ -24,7 +24,8 @@ const GIF_LIBRARY_DIR = resolve(process.env.KURUMI_GIF_LIBRARY ?? "/state/gif-li
 const LOOSE_TOOLS_DIR = resolve(process.env.KURUMI_LOOSE_TOOLS ?? "/kurumi-tools/loose");
 const LOOSE_TOOLS_INDEX = resolve(LOOSE_TOOLS_DIR, "index.json");
 const LOOSE_TOOL_NAME_RE = /^[a-z][a-z0-9_-]{0,40}$/i;
-const SLASH_COMMANDS_FILE = resolve(process.env.KURUMI_SLASH_COMMANDS_FILE ?? "/state/slash-commands.json");
+const LOOSE_COMMANDS_DIR = resolve(process.env.KURUMI_LOOSE_COMMANDS ?? "/kurumi-tools/loose-commands");
+const LOOSE_COMMANDS_FILE = resolve(process.env.KURUMI_LOOSE_COMMANDS_FILE ?? "/state/loose-commands.json");
 const SLASH_NAME_RE = /^[\w-]{1,32}$/;
 // Discord application command option types we support. Strings, integers,
 // booleans, users, channels, roles cover ~everything a casual command needs.
@@ -57,9 +58,9 @@ const SELF_TOOL_NAMES = new Set([
   "loose_tool_list",
   "loose_tool_run",
   "loose_tool_remove",
-  "slash_command_register",
-  "slash_command_list",
-  "slash_command_unregister",
+  "loose_command_create",
+  "loose_command_list",
+  "loose_command_remove",
 ]);
 
 // Scope shape: "global" | "guild:<id>" | "channel:<id>" | "user:<id>".
@@ -113,17 +114,17 @@ function saveLooseTools(tools) {
   writeFileSync(LOOSE_TOOLS_INDEX, JSON.stringify(tools, null, 2));
 }
 
-function loadSlashCommands() {
-  if (!existsSync(SLASH_COMMANDS_FILE)) return {};
+function loadLooseCommands() {
+  if (!existsSync(LOOSE_COMMANDS_FILE)) return {};
   try {
-    const parsed = JSON.parse(readFileSync(SLASH_COMMANDS_FILE, "utf8"));
+    const parsed = JSON.parse(readFileSync(LOOSE_COMMANDS_FILE, "utf8"));
     return parsed && typeof parsed === "object" ? parsed : {};
   } catch { return {}; }
 }
 
-function saveSlashCommands(map) {
-  mkdirSync(dirname(SLASH_COMMANDS_FILE), { recursive: true });
-  writeFileSync(SLASH_COMMANDS_FILE, JSON.stringify(map, null, 2));
+function saveLooseCommands(map) {
+  mkdirSync(dirname(LOOSE_COMMANDS_FILE), { recursive: true });
+  writeFileSync(LOOSE_COMMANDS_FILE, JSON.stringify(map, null, 2));
 }
 
 async function discordApi(path, method, body) {
@@ -596,19 +597,20 @@ const ALL_TOOLS = [
       },
     },
     {
-      name: "slash_command_register",
+      name: "loose_command_create",
       description:
-        "Register a Discord slash command at runtime that dispatches to a loose tool. **No bot restart needed.** Guild-scoped commands appear instantly; global ones take up to 1 hour to propagate to all of Discord. The command's option values are passed to the loose tool as JSON args (e.g. `/roast target:@nic intensity:high` → `{target: '<userId>', intensity: 'high'}`). The bot also injects `__invokedBy`, `__invokedByTag`, `__channelId`, `__guildId` so the script knows who called it where. Loose tool's stdout (first 1900 chars) becomes the reply.",
+        "Author a NEW Discord slash command at runtime — completely self-contained. Writes the script to /kurumi-tools/loose-commands/<name>.<sh|js>, registers metadata in /state/loose-commands.json, AND posts to Discord's REST API to register the command Discord-side. No restart, no rebuild. **Pass guildId for instant visibility** — global commands take up to 1 hour to propagate. Unlike loose_tool_create (internal scripts only YOU can invoke), this exposes a /command users can type. When invoked, every option value the user supplied + injected metadata (__invokedBy, __invokedByTag, __channelId, __guildId) is JSON-encoded and handed to the script as argv[2]. Stdout (up to 1900 chars) becomes the reply.",
       inputSchema: {
         type: "object",
         properties: {
-          name: { type: "string", description: "Slash command name. 1–32 chars, [a-z0-9_-]. No spaces, no uppercase." },
-          description: { type: "string", description: "1–100 char description shown in Discord's UI." },
-          looseToolName: { type: "string", description: "Name of an existing loose tool (must be created first with loose_tool_create) that will be executed when this command is invoked." },
-          guildId: { type: "string", description: "If set, command is registered only in this guild (instant). Omit for global registration (slower propagation, but visible everywhere)." },
+          name: { type: "string", description: "Command name. 1–32 chars, lowercase [a-z0-9_-]. Shown to users as /<name>." },
+          description: { type: "string", description: "1–100 char description shown in Discord's slash menu." },
+          interpreter: { type: "string", enum: ["bash", "node"], description: "How to invoke the script — 'bash' (saved .sh) or 'node' (saved .js)." },
+          code: { type: "string", description: "Complete script source. Shebang auto-prepended. Parse args with `JSON.parse(process.argv[2] || '{}')` in node or `jq -r '.foo' <<< \"$1\"` in bash. Print result to stdout." },
+          guildId: { type: "string", description: "Register guild-scoped (instant). Omit for global (slow propagation, visible in every guild). Strongly prefer guildId — global commands clutter the user's slash menu everywhere." },
           options: {
             type: "array",
-            description: "Optional slash command parameters. Each: {name, description, type, required?}. type ∈ string|integer|number|boolean|user|channel|role.",
+            description: "Optional command parameters. Each: {name, description, type, required?}. type ∈ string|integer|number|boolean|user|channel|role.",
             items: {
               type: "object",
               properties: {
@@ -622,23 +624,23 @@ const ALL_TOOLS = [
             },
           },
         },
-        required: ["name", "description", "looseToolName"],
+        required: ["name", "description", "interpreter", "code"],
         additionalProperties: false,
       },
     },
     {
-      name: "slash_command_list",
-      description: "List every slash command Kurumi has registered, with their loose-tool mapping, guild scope, and Discord-side command id.",
+      name: "loose_command_list",
+      description: "List every registered loose command with name, description, script path, interpreter, guild scope, and Discord-side command id.",
       inputSchema: { type: "object", additionalProperties: false },
     },
     {
-      name: "slash_command_unregister",
-      description: "Remove a slash command from Discord and from the dispatch map. Pass the command name; guildId is required only if it was registered guild-scoped.",
+      name: "loose_command_remove",
+      description: "Permanently delete a loose command: deletes script file, removes from dispatch map, AND deletes the Discord-side registration so it stops appearing in the slash menu. Pass guildId if it was registered guild-scoped (otherwise the stored guildId is used).",
       inputSchema: {
         type: "object",
         properties: {
           name: { type: "string" },
-          guildId: { type: "string", description: "Required when removing a guild-scoped command, omit for global." },
+          guildId: { type: "string", description: "Only needed if you want to override the stored guildId." },
         },
         required: ["name"],
         additionalProperties: false,
@@ -1052,53 +1054,78 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     return { content: [{ type: "text", text: `ok — removed loose tool '${toolName}'` }] };
   }
 
-  if (name === "slash_command_register") {
-    const slashName = String(args?.name ?? "").trim().toLowerCase();
+  if (name === "loose_command_create") {
+    const cmdName = String(args?.name ?? "").trim().toLowerCase();
     const description = String(args?.description ?? "").trim();
-    const looseToolName = String(args?.looseToolName ?? "").trim();
+    const interpreter = String(args?.interpreter ?? "").trim();
+    const code = String(args?.code ?? "");
     const guildId = args?.guildId ? String(args.guildId) : null;
     const optionsIn = Array.isArray(args?.options) ? args.options : [];
-    if (!SLASH_NAME_RE.test(slashName)) return { content: [{ type: "text", text: "name must match [\\w-]{1,32} lowercase" }], isError: true };
+    if (!SLASH_NAME_RE.test(cmdName)) return { content: [{ type: "text", text: "name must match [\\w-]{1,32} lowercase" }], isError: true };
     if (!description || description.length > 100) return { content: [{ type: "text", text: "description required, max 100 chars" }], isError: true };
-    if (!loadLooseTools().some((t) => t.name === looseToolName)) {
-      return { content: [{ type: "text", text: `loose tool '${looseToolName}' does not exist — create it first with loose_tool_create` }], isError: true };
-    }
-    const options = optionsIn.map((o) => {
-      const t = SLASH_OPTION_TYPES[o.type];
-      if (!t) throw new Error(`unsupported option type: ${o.type}`);
-      return { name: String(o.name).toLowerCase(), description: String(o.description), type: t, required: !!o.required };
-    });
-    const body = { name: slashName, description, type: 1, options };
+    if (interpreter !== "bash" && interpreter !== "node") return { content: [{ type: "text", text: "interpreter must be 'bash' or 'node'" }], isError: true };
+    if (!code) return { content: [{ type: "text", text: "code is required" }], isError: true };
+    const existing = loadLooseCommands();
+    if (existing[cmdName]) return { content: [{ type: "text", text: `loose command '/${cmdName}' already exists — remove it first` }], isError: true };
+
+    let options;
+    try {
+      options = optionsIn.map((o) => {
+        const t = SLASH_OPTION_TYPES[o.type];
+        if (!t) throw new Error(`unsupported option type: ${o.type}`);
+        return { name: String(o.name).toLowerCase(), description: String(o.description), type: t, required: !!o.required };
+      });
+    } catch (e) { return { content: [{ type: "text", text: e.message }], isError: true }; }
+
+    // Write the script to disk first; if Discord registration fails after,
+    // we delete it so we don't leak orphan scripts.
+    const ext = interpreter === "bash" ? "sh" : "js";
+    const shebang = interpreter === "bash" ? "#!/bin/bash\nset -e\n" : "#!/usr/bin/env node\n";
+    const scriptPath = resolve(LOOSE_COMMANDS_DIR, `${cmdName}.${ext}`);
+    mkdirSync(LOOSE_COMMANDS_DIR, { recursive: true });
+    const finalCode = code.startsWith("#!") ? code : shebang + code;
+    writeFileSync(scriptPath, finalCode, { mode: 0o755 });
+
     let created;
     try {
-      created = await discordApi(guildId ? `/guilds/${guildId}/commands` : "/commands", "POST", body);
-    } catch (e) { return { content: [{ type: "text", text: e.message }], isError: true }; }
-    const map = loadSlashCommands();
-    map[slashName] = { looseToolName, guildId, commandId: created.id, registeredAt: new Date().toISOString() };
-    saveSlashCommands(map);
-    return { content: [{ type: "text", text: `ok — registered /${slashName} → ${looseToolName} (${guildId ? `guild ${guildId}` : "global"}), discord id ${created.id}. ${guildId ? "Visible immediately." : "May take up to 1 hour to appear in all guilds."}` }] };
+      created = await discordApi(guildId ? `/guilds/${guildId}/commands` : "/commands", "POST", { name: cmdName, description, type: 1, options });
+    } catch (e) {
+      try { rmSync(scriptPath, { force: true }); } catch { /* ignore */ }
+      return { content: [{ type: "text", text: `Discord registration failed (script removed): ${e.message}` }], isError: true };
+    }
+    existing[cmdName] = {
+      scriptPath, interpreter, description,
+      guildId, commandId: created.id,
+      registeredAt: new Date().toISOString(),
+    };
+    saveLooseCommands(existing);
+    return { content: [{ type: "text", text: `ok — registered /${cmdName} (${guildId ? `guild ${guildId}` : "global"}). Script at ${scriptPath}. ${guildId ? "Visible immediately." : "May take up to 1 hour to appear in all guilds."}` }] };
   }
 
-  if (name === "slash_command_list") {
-    return { content: [{ type: "text", text: JSON.stringify(loadSlashCommands(), null, 2) }] };
+  if (name === "loose_command_list") {
+    return { content: [{ type: "text", text: JSON.stringify(loadLooseCommands(), null, 2) }] };
   }
 
-  if (name === "slash_command_unregister") {
-    const slashName = String(args?.name ?? "").trim().toLowerCase();
-    const guildId = args?.guildId ? String(args.guildId) : null;
-    const map = loadSlashCommands();
-    const entry = map[slashName];
-    if (!entry) return { content: [{ type: "text", text: `no slash command named /${slashName}` }], isError: true };
-    const effectiveGuild = guildId ?? entry.guildId ?? null;
+  if (name === "loose_command_remove") {
+    const cmdName = String(args?.name ?? "").trim().toLowerCase();
+    const guildIdOverride = args?.guildId ? String(args.guildId) : null;
+    const map = loadLooseCommands();
+    const entry = map[cmdName];
+    if (!entry) return { content: [{ type: "text", text: `no loose command named /${cmdName}` }], isError: true };
+    const effectiveGuild = guildIdOverride ?? entry.guildId ?? null;
     try {
       await discordApi(
         effectiveGuild ? `/guilds/${effectiveGuild}/commands/${entry.commandId}` : `/commands/${entry.commandId}`,
         "DELETE",
       );
-    } catch (e) { return { content: [{ type: "text", text: e.message }], isError: true }; }
-    delete map[slashName];
-    saveSlashCommands(map);
-    return { content: [{ type: "text", text: `ok — unregistered /${slashName}` }] };
+    } catch (e) {
+      // If Discord says 404, the command was already gone — proceed with local cleanup.
+      if (!/404/.test(e.message)) return { content: [{ type: "text", text: e.message }], isError: true };
+    }
+    try { rmSync(entry.scriptPath, { force: true }); } catch { /* ignore */ }
+    delete map[cmdName];
+    saveLooseCommands(map);
+    return { content: [{ type: "text", text: `ok — removed /${cmdName} (script + Discord registration)` }] };
   }
 
   if (name === "auto_respond_add") {

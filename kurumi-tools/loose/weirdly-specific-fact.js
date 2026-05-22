@@ -1,6 +1,4 @@
 #!/usr/bin/env node
-// Weirdly specific fact generator — obscure, oddly precise knowledge
-
 const facts = [
   "Bananas are berries, but strawberries aren't. Also, bananas are sterile and can only be propagated from shoots.",
   "The shortest war in history was between Britain and Zanzibar in 1896 — it lasted 38 to 45 minutes.",
@@ -33,21 +31,7 @@ const facts = [
   "Scotland tried to ban Muslim headscarves in 2014 but accidentally banned face paint, masks, and costumes in the process.",
   "Penguin knees exist — they're just hidden inside their bodies, making them appear to be all legs and torso.",
 ];
-
 function getRandomFact() {
   return facts[Math.floor(Math.random() * facts.length)];
 }
-
-function getFactCount() {
-  return facts.length;
-}
-
-module.exports = {
-  getRandomFact,
-  getFactCount,
-  facts
-};
-
-if (require.main === module) {
-  console.log(getRandomFact());
-}
+console.log(getRandomFact());

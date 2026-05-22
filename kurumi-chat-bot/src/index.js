@@ -17,7 +17,8 @@ const ATTACHMENT_DIR = resolve(process.env.KURUMI_ATTACHMENT_DIR ?? "/state/atta
 const GIF_INDEX_FILE = resolve(process.env.KURUMI_GIF_INDEX ?? "/state/gif-library/index.json");
 const GIF_LIBRARY_DIR = resolve(process.env.KURUMI_GIF_LIBRARY ?? "/state/gif-library");
 const LOOSE_TOOLS_DIR = resolve(process.env.KURUMI_LOOSE_TOOLS ?? "/kurumi-tools/loose");
-const SLASH_COMMANDS_FILE = resolve(process.env.KURUMI_SLASH_COMMANDS_FILE ?? "/state/slash-commands.json");
+const LOOSE_COMMANDS_DIR = resolve(process.env.KURUMI_LOOSE_COMMANDS ?? "/kurumi-tools/loose-commands");
+const LOOSE_COMMANDS_FILE = resolve(process.env.KURUMI_LOOSE_COMMANDS_FILE ?? "/state/loose-commands.json");
 const HISTORY_LINES = Number(process.env.KURUMI_HISTORY_LINES ?? 10);
 
 const IMAGE_CT_RE = /^image\/(png|jpe?g|gif|webp|bmp)$/i;
@@ -263,7 +264,17 @@ That's it. One paragraph. No further tool calls until you get an answer. Scope d
 
 **LOOSE TOOLS — extending yourself without a rebuild.** You have four MCP tools for authoring callable tools on the fly: \`loose_tool_create(name, description, interpreter, code, argsHint?)\` writes a script to \`/kurumi-tools/loose/<name>.<sh|js>\` and registers metadata in \`/kurumi-tools/loose/index.json\`. \`loose_tool_list()\` shows what you have. \`loose_tool_run({name, args})\` executes a registered tool — args are JSON-encoded and arrive as \`argv[2]\` (parse with \`JSON.parse(process.argv[2] || "{}")\` in node or \`jq -r '.foo' <<< "$1"\` in bash); stdout becomes the result; 30s timeout; 16 KB output cap. \`loose_tool_remove(name)\` deletes one. This is for legitimate self-extension (a recurring API caller, a custom formatter, a niche wrapper) — NOT for bypassing scope rules. Every limit above still applies inside the script.
 
-**SLASH COMMANDS — exposing loose tools to users.** Once you have a loose tool, you can expose it as a real Discord slash command at runtime — no restart. \`slash_command_register({name, description, looseToolName, guildId?, options?})\` calls Discord's REST API and persists the mapping to \`/state/slash-commands.json\`. **Pass \`guildId\` for instant visibility** — global commands take up to 1 hour to propagate. \`options\` is an array like \`[{name:"target", description:"who to roast", type:"user", required:true}]\` — supported types: string, integer, number, boolean, user, channel, role. When invoked, the user's option values + injected metadata (\`__invokedBy\`, \`__invokedByTag\`, \`__channelId\`, \`__guildId\`) are JSON-encoded and handed to your loose tool as argv[2]; the tool's stdout becomes the reply. \`slash_command_list()\` shows what's registered; \`slash_command_unregister({name, guildId?})\` removes one. **The typical flow**: \`loose_tool_create\` → \`slash_command_register guildId:<the current guild>\` → user types \`/<name>\` → magic.
+**LOOSE COMMANDS — Discord slash commands you can author at runtime.** Completely separate from loose tools. A *loose tool* is an internal script only YOU can invoke via \`loose_tool_run\`. A *loose command* is a real Discord slash command users type with \`/\` — its own script, its own Discord registration, no overlap with loose tools.
+
+- \`loose_command_create({name, description, interpreter, code, guildId?, options?})\` — writes \`/kurumi-tools/loose-commands/<name>.<sh|js>\`, POSTs to Discord's REST API to register the slash command, persists mapping to \`/state/loose-commands.json\`. **Always pass \`guildId\` of the guild the user is in** — global commands take up to 1 hour to propagate; guild commands appear instantly. \`options\` is \`[{name, description, type, required?}]\` with types: string, integer, number, boolean, user, channel, role.
+- \`loose_command_list()\` — shows everything you've registered.
+- \`loose_command_remove({name, guildId?})\` — deletes script + Discord registration in one call.
+
+When a user invokes the command, the bot spawns your script with all option values + injected metadata (\`__invokedBy\`, \`__invokedByTag\`, \`__channelId\`, \`__guildId\`) as a single JSON string on \`argv[2]\`. Parse with \`JSON.parse(process.argv[2] || "{}")\` in node or \`jq -r '.foo' <<< "$1"\` in bash. Stdout (first 1900 chars) becomes the reply. 30s timeout; non-zero exit shows stderr as an ephemeral error.
+
+**Two distinct flows you'll choose between:**
+- Want a private internal helper? → \`loose_tool_create\` → \`loose_tool_run\`. Users never see it.
+- Want users to type \`/foo bar:baz\`? → \`loose_command_create\` with that exact name + options. Skip loose tools entirely.
 
 **The /kurumi-tools folder is for SMALL, SELF-CONTAINED scripts** — bash one-liners, tiny Node utilities that use libraries already installed, simple curl wrappers. It is NOT for "let me set up a full headless browser stack". If a tool needs anything beyond \`bash\`, \`node\` with already-installed npm packages, \`curl\`, and standard Unix utilities, **that's a Dockerfile change**, not a /kurumi-tools script. Surface it to the owner.
 
@@ -372,61 +383,29 @@ function enqueueChannelWork(channelId, work) {
   return { accepted: true, queued: entry.depth > 1, position: entry.depth };
 }
 
-// Runtime slash-command dispatch. Mapping ({commandName -> looseToolName})
-// lives in /state/slash-commands.json. Discord-side registration is done via
-// the REST API by the slash_command_register self-MCP tool — no restart
-// needed. This handler just routes the InteractionCreate event into the
-// matching loose tool, collects its stdout, and replies. 30s timeout per
-// command, automatic deferReply if anything takes longer than 2.5s.
-function loadSlashCommandMap() {
-  if (!existsSync(SLASH_COMMANDS_FILE)) return {};
+// Runtime loose-command dispatch. A "loose command" is a self-contained
+// Discord slash command: its own script file in /kurumi-tools/loose-commands/
+// and its own registration metadata in /state/loose-commands.json. Authored
+// + registered by Kurumi via the loose_command_* self-MCP tools — no
+// restart, no source edit. Distinct from "loose tools" (internal MCP-callable
+// scripts she invokes herself).
+function loadLooseCommandMap() {
+  if (!existsSync(LOOSE_COMMANDS_FILE)) return {};
   try {
-    const parsed = JSON.parse(readFileSync(SLASH_COMMANDS_FILE, "utf8"));
+    const parsed = JSON.parse(readFileSync(LOOSE_COMMANDS_FILE, "utf8"));
     return parsed && typeof parsed === "object" ? parsed : {};
   } catch { return {}; }
 }
 
-function loadLooseToolsIndex() {
-  const indexPath = resolve(LOOSE_TOOLS_DIR, "index.json");
-  if (!existsSync(indexPath)) return [];
-  try {
-    const arr = JSON.parse(readFileSync(indexPath, "utf8"));
-    return Array.isArray(arr) ? arr : [];
-  } catch { return []; }
-}
-
-async function runLooseToolByName(toolName, args) {
-  const tool = loadLooseToolsIndex().find((t) => t.name === toolName);
-  if (!tool) return { ok: false, output: `loose tool '${toolName}' not found` };
-  if (!existsSync(tool.path)) return { ok: false, output: `loose tool script missing at ${tool.path}` };
-  const payload = JSON.stringify(args ?? {});
-  const cmd = tool.interpreter === "bash" ? "bash" : "node";
-  return await new Promise((resolveCall) => {
-    const child = spawn(cmd, [tool.path, payload], { stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "", stderr = "";
-    child.stdout.on("data", (d) => { stdout += d.toString(); if (stdout.length > 16_384) child.kill("SIGKILL"); });
-    child.stderr.on("data", (d) => { stderr += d.toString(); if (stderr.length > 16_384) child.kill("SIGKILL"); });
-    const timer = setTimeout(() => child.kill("SIGKILL"), 30_000);
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      resolveCall({
-        ok: code === 0,
-        output: code === 0
-          ? (stdout.trim() || "*(no output)*")
-          : `\`/${toolName}\` failed (exit ${code}):\n\`\`\`\n${(stderr || stdout).slice(-1500)}\n\`\`\``,
-      });
-    });
-    child.on("error", (e) => { clearTimeout(timer); resolveCall({ ok: false, output: `spawn error: ${e.message}` }); });
-  });
-}
-
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand?.()) return;
-  const map = loadSlashCommandMap();
+  const map = loadLooseCommandMap();
   const entry = map[interaction.commandName];
-  if (!entry) return;
-  const looseToolName = typeof entry === "string" ? entry : entry.looseToolName;
-  if (!looseToolName) return;
+  if (!entry || !entry.scriptPath) return;
+  if (!existsSync(entry.scriptPath)) {
+    await interaction.reply({ content: `*(loose command script missing at ${entry.scriptPath} — owner needs to re-register)*`, ephemeral: true }).catch(() => {});
+    return;
+  }
 
   // Collect every option the user supplied into a flat JSON object. Discord
   // option types are coerced to JS primitives by discord.js — strings stay
@@ -448,15 +427,28 @@ client.on(Events.InteractionCreate, async (interaction) => {
     interaction.deferReply().catch(() => {});
   }, 2_500);
 
-  const { ok, output } = await runLooseToolByName(looseToolName, args);
-  clearTimeout(deferTimer);
-  const reply = output.slice(0, 1900);
-  try {
-    if (interaction.deferred) await interaction.editReply(reply);
-    else await interaction.reply({ content: reply, ephemeral: !ok });
-  } catch (e) {
-    console.error(`[slash] /${interaction.commandName} reply failed:`, e.message);
-  }
+  const cmd = entry.interpreter === "bash" ? "bash" : "node";
+  const child = spawn(cmd, [entry.scriptPath, JSON.stringify(args)], { stdio: ["ignore", "pipe", "pipe"] });
+  let stdout = "", stderr = "";
+  child.stdout.on("data", (d) => { stdout += d.toString(); if (stdout.length > 16_384) child.kill("SIGKILL"); });
+  child.stderr.on("data", (d) => { stderr += d.toString(); if (stderr.length > 16_384) child.kill("SIGKILL"); });
+  const killTimer = setTimeout(() => child.kill("SIGKILL"), 30_000);
+
+  child.on("close", async (code) => {
+    clearTimeout(deferTimer);
+    clearTimeout(killTimer);
+    const reply = code === 0
+      ? (stdout.trim() || "*(no output)*").slice(0, 1900)
+      : `\`/${interaction.commandName}\` failed (exit ${code}):\n\`\`\`\n${(stderr || stdout).slice(-1500)}\n\`\`\``;
+    try {
+      if (interaction.deferred) await interaction.editReply(reply);
+      else await interaction.reply({ content: reply, ephemeral: code !== 0 });
+    } catch (e) { console.error(`[loose-cmd] /${interaction.commandName} reply failed:`, e.message); }
+  });
+  child.on("error", async (e) => {
+    clearTimeout(deferTimer); clearTimeout(killTimer);
+    try { await interaction.reply({ content: `spawn error: ${e.message}`, ephemeral: true }); } catch { /* ignore */ }
+  });
 });
 
 client.on(Events.MessageCreate, async (msg) => {

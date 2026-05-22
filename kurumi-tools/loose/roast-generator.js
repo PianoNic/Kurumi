@@ -1,6 +1,4 @@
 #!/usr/bin/env node
-// Roast generator — playful, edgy comebacks and burns
-
 const templates = [
   "I'd roast you, but my mom told me not to play with trash.",
   "You're not dumb, you're just operating on different software.",
@@ -32,30 +30,22 @@ const templates = [
   "You're a living reminder that natural selection isn't working.",
   "If your face was a LinkedIn profile, it'd say 'under maintenance.'",
 ];
-
 function getRandomRoast() {
   return templates[Math.floor(Math.random() * templates.length)];
 }
-
 function generateRoastFor(name) {
   const roast = getRandomRoast();
-  return roast.replace(/you/gi, (match) => {
-    return match === 'you' ? name || 'you' : name.toUpperCase() || 'YOU';
-  });
+  if (!name) return roast;
+  return roast.replace(/you/gi, (match) => match === 'you' ? name : name.toUpperCase());
 }
-
-module.exports = {
-  getRandomRoast,
-  generateRoastFor,
-  templates
-};
-
-if (require.main === module) {
-  const name = process.argv[2];
-
-  if (name) {
-    console.log(generateRoastFor(name));
-  } else {
-    console.log(getRandomRoast());
+const argsJson = process.argv[2];
+let target = '';
+if (argsJson) {
+  try {
+    const args = JSON.parse(argsJson);
+    target = args.target || '';
+  } catch {
+    target = argsJson;
   }
 }
+console.log(generateRoastFor(target));
