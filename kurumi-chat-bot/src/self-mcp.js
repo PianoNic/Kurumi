@@ -13,12 +13,14 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { z } from "zod";
 
 const CONFIG_FILE = resolve(process.env.KURUMI_CONFIG_FILE ?? "/state/kurumi-config.json");
 const NOTES_FILE = resolve(process.env.KURUMI_NOTES_FILE ?? "/state/kurumi-notes.json");
+const GIF_INDEX_FILE = resolve(process.env.KURUMI_GIF_INDEX ?? "/state/gif-library/index.json");
+const GIF_LIBRARY_DIR = resolve(process.env.KURUMI_GIF_LIBRARY ?? "/state/gif-library");
 
 // Tier set per-spawn by the bot via the MCP server's env block:
 //   "admin" — owner. Everything: read + write config, mute users, reset, etc.
@@ -38,6 +40,11 @@ const SELF_TOOL_NAMES = new Set([
   "unmute_channel",
   "auto_respond_add",
   "auto_respond_remove",
+  "gif_save",
+  "gif_save_from_url",
+  "gif_list",
+  "gif_search",
+  "gif_remove",
 ]);
 
 // Scope shape: "global" | "guild:<id>" | "channel:<id>" | "user:<id>".
@@ -65,21 +72,27 @@ function saveNotes(notes) {
   writeFileSync(NOTES_FILE, JSON.stringify(notes, null, 2));
 }
 
+function loadGifIndex() {
+  if (!existsSync(GIF_INDEX_FILE)) return [];
+  try {
+    const arr = JSON.parse(readFileSync(GIF_INDEX_FILE, "utf8"));
+    return Array.isArray(arr) ? arr : [];
+  } catch { return []; }
+}
+
+function saveGifIndex(index) {
+  mkdirSync(GIF_LIBRARY_DIR, { recursive: true });
+  writeFileSync(GIF_INDEX_FILE, JSON.stringify(index, null, 2));
+}
+
 // Settable keys with their schemas and human descriptions. Any key not in
 // here is rejected by config_set. Free-form values are validated per-key;
 // bad inputs come back as a tool error.
 const SCHEMA = {
   model: {
-    type: z.enum([
-      "claude-haiku-4-5",
-      "claude-sonnet-4-5",
-      "claude-opus-4-5",
-      "sonnet",
-      "opus",
-      "haiku",
-    ]),
+    type: z.string().min(1).max(120),
     description:
-      "Claude model used for every reply. haiku = cheap and fast, sonnet = balanced (default), opus = most capable and expensive.",
+      "Model name used for every reply. Default: claude-haiku-4-5. When anthropicBaseUrl is set, this can be ANY model name your endpoint accepts (e.g. 'glm-4.6', 'deepseek-chat', 'gpt-4o-mini' via a compat shim). Anthropic policy: sonnet/opus forbidden — stick to haiku unless using a non-Anthropic endpoint.",
   },
   effort: {
     type: z.enum(["low", "medium", "high", "xhigh", "max"]),
@@ -164,16 +177,24 @@ const SCHEMA = {
       "When true (default), in auto-respond zones Kurumi runs a cheap secondary inference (model: casualMessageGatingModel) to decide whether each casual message is worth replying to. Lets her sit quietly through inter-user banter and only jump in when she'd actually add value. Disable to make her reply to every qualifying message in auto-respond zones.",
   },
   casualMessageGatingModel: {
-    type: z.enum([
-      "claude-haiku-4-5",
-      "claude-sonnet-4-5",
-      "claude-opus-4-5",
-      "sonnet",
-      "opus",
-      "haiku",
-    ]),
+    type: z.string().min(1).max(120),
     description:
       "Model used for the should-I-respond decision in auto-respond zones. Defaults to haiku (cheap and fast). Switch to sonnet if she's making bad judgement calls.",
+  },
+  anthropicBaseUrl: {
+    type: z.union([z.string().url(), z.null()]),
+    description:
+      "Custom Anthropic-compatible API base URL. Set this to point claude-code at a non-Anthropic backend: Z.AI / GLM ('https://api.z.ai/api/anthropic'), OpenRouter via anthropic shim, LiteLLM proxy, local vLLM with anthropic-translate, etc. Leave null to use Anthropic's official API. Restart the bot or wait for the next message — change picks up on the next spawn.",
+  },
+  anthropicAuthToken: {
+    type: z.union([z.string().min(1), z.null()]),
+    description:
+      "Auth token for the custom endpoint above. Sent as ANTHROPIC_AUTH_TOKEN when anthropicBaseUrl is set, otherwise treated as ANTHROPIC_API_KEY fallback. Stored in /state/kurumi-config.json — keep that volume out of any repo.",
+  },
+  smallFastModel: {
+    type: z.union([z.string().min(1).max(120), z.null()]),
+    description:
+      "Optional ANTHROPIC_SMALL_FAST_MODEL override for claude-code's internal cheap-model slot (compaction, edits, etc.). Useful with custom endpoints that don't ship haiku.",
   },
 };
 
@@ -371,6 +392,88 @@ const ALL_TOOLS = [
         additionalProperties: false,
       },
     },
+    {
+      name: "gif_save",
+      description:
+        "Add a GIF (or any image attachment) you've seen to your persistent GIF library so you can reuse it later like a sticker via the {{gif:<id>}} macro. Pass the local path of an attachment from your /state/attachments folder (the context block lists them), plus a short description and a few tags. Inspect the file with Read first if you haven't already — saving without looking is wasteful. Returns the new gif id.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          sourcePath: {
+            type: "string",
+            description: "Absolute path to the source image, typically /state/attachments/<...>.",
+          },
+          name: {
+            type: "string",
+            description: "Short slug-friendly name. Examples: 'kurumi-wink', 'cat-typing', 'sad-anime-girl'.",
+          },
+          description: {
+            type: "string",
+            description: "One-sentence description of what the GIF shows and the emotional beat. Used by future-you to decide when to send it.",
+          },
+          tags: {
+            type: "array",
+            items: { type: "string" },
+            description: "3–8 short tags. Examples: ['reaction','approval','smug'], ['celebration','joy'], ['confused','idk'].",
+          },
+        },
+        required: ["sourcePath", "name", "description", "tags"],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "gif_save_from_url",
+      description:
+        "Save a GIF from a URL. Accepts direct media URLs (.gif/.mp4/.webp/.png/.jpg from media.discordapp.net, cdn.discord, tenor.com/media, c.tenor.com, media.tenor.com, media.giphy.com, etc.) AND Tenor/Giphy view pages (tenor.com/view/..., giphy.com/gifs/...) — for view pages, the tool scrapes the og:image / og:video meta tag and downloads the underlying media automatically. Use this when someone links a GIF instead of attaching a file. Inspect the source URL or a downloaded preview first if you're unsure it's the right one.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          url: { type: "string", description: "Direct media URL or Tenor/Giphy view page URL." },
+          name: { type: "string", description: "Short slug-friendly name." },
+          description: { type: "string", description: "One-sentence description of what it shows + the vibe." },
+          tags: {
+            type: "array",
+            items: { type: "string" },
+            description: "3–8 short tags. Examples: ['reaction','smug'], ['celebration','joy'].",
+          },
+        },
+        required: ["url", "name", "description", "tags"],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "gif_list",
+      description:
+        "List every saved GIF in your library with its id, name, description, tags, and path. Use this to remember what you have.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          tag: { type: "string", description: "Optional: filter to GIFs that have this tag." },
+        },
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "gif_search",
+      description:
+        "Search saved GIFs by substring against name, description, or any tag. Use this when you want to find a fitting GIF for the current moment.",
+      inputSchema: {
+        type: "object",
+        properties: { query: { type: "string" } },
+        required: ["query"],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "gif_remove",
+      description: "Permanently delete a saved GIF (file + index entry) by id.",
+      inputSchema: {
+        type: "object",
+        properties: { id: { type: "string" } },
+        required: ["id"],
+        additionalProperties: false,
+      },
+    },
 ];
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
@@ -551,6 +654,147 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   if (name === "unmute_channel") return setListRemove("mutedChannels", args?.channelId);
   if (name === "mute_user")      return setListAdd("mutedUsers", args?.userId, /^\d+$/);
   if (name === "unmute_user")    return setListRemove("mutedUsers", args?.userId);
+
+  if (name === "gif_save") {
+    const sourcePath = String(args?.sourcePath ?? "");
+    const niceName = String(args?.name ?? "").trim().replace(/[^a-z0-9._-]+/gi, "-").slice(0, 60);
+    const description = String(args?.description ?? "").trim();
+    const tags = Array.isArray(args?.tags) ? args.tags.map(String).map((t) => t.trim().toLowerCase()).filter(Boolean) : [];
+    if (!sourcePath || !existsSync(sourcePath)) {
+      return { content: [{ type: "text", text: `sourcePath does not exist: ${sourcePath}` }], isError: true };
+    }
+    if (!niceName || !description || tags.length === 0) {
+      return { content: [{ type: "text", text: "name, description, and at least one tag are required" }], isError: true };
+    }
+    const ext = (sourcePath.match(/\.[a-z0-9]+$/i)?.[0] ?? ".gif").toLowerCase();
+    const id = `g_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    mkdirSync(GIF_LIBRARY_DIR, { recursive: true });
+    const destPath = resolve(GIF_LIBRARY_DIR, `${id}-${niceName}${ext}`);
+    try { copyFileSync(sourcePath, destPath); }
+    catch (e) { return { content: [{ type: "text", text: `copy failed: ${e.message}` }], isError: true }; }
+    const index = loadGifIndex();
+    index.push({
+      id, name: niceName, description, tags,
+      path: destPath, ext, addedAt: new Date().toISOString(),
+    });
+    saveGifIndex(index);
+    return { content: [{ type: "text", text: `ok — saved as ${id} at ${destPath}` }] };
+  }
+
+  if (name === "gif_save_from_url") {
+    const url = String(args?.url ?? "").trim();
+    const niceName = String(args?.name ?? "").trim().replace(/[^a-z0-9._-]+/gi, "-").slice(0, 60);
+    const description = String(args?.description ?? "").trim();
+    const tags = Array.isArray(args?.tags)
+      ? args.tags.map(String).map((t) => t.trim().toLowerCase()).filter(Boolean)
+      : [];
+    if (!/^https?:\/\//i.test(url)) {
+      return { content: [{ type: "text", text: "url must start with http(s)://" }], isError: true };
+    }
+    if (!niceName || !description || tags.length === 0) {
+      return { content: [{ type: "text", text: "name, description, and at least one tag are required" }], isError: true };
+    }
+
+    // Resolve view-page URLs (tenor.com/view/..., giphy.com/gifs/...) to the
+    // underlying media URL by scraping og:image / og:video meta tags. Direct
+    // media URLs pass through unchanged.
+    let mediaUrl = url;
+    const isViewPage =
+      /tenor\.com\/view\//i.test(url) ||
+      /giphy\.com\/gifs\//i.test(url) ||
+      (!/\.(gif|mp4|webp|webm|png|jpe?g)(\?|$)/i.test(url) && /tenor\.com|giphy\.com/i.test(url));
+    if (isViewPage) {
+      try {
+        const html = await (await fetch(url, {
+          headers: { "user-agent": "Mozilla/5.0 KurumiBot" },
+          redirect: "follow",
+        })).text();
+        const ogVideo = html.match(/<meta[^>]+property=["']og:video["'][^>]+content=["']([^"']+)["']/i)?.[1];
+        const ogImage = html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i)?.[1];
+        // Prefer gif/mp4 — prefer image (usually .gif) for Tenor since Discord
+        // renders it inline as an animation; fall back to og:video (mp4).
+        mediaUrl = ogImage || ogVideo || url;
+      } catch (e) {
+        return { content: [{ type: "text", text: `failed to scrape ${url}: ${e.message}` }], isError: true };
+      }
+    }
+
+    let buf;
+    let contentType = "";
+    try {
+      const res = await fetch(mediaUrl, {
+        headers: { "user-agent": "Mozilla/5.0 KurumiBot", referer: url },
+        redirect: "follow",
+      });
+      if (!res.ok) {
+        return { content: [{ type: "text", text: `download failed: HTTP ${res.status} for ${mediaUrl}` }], isError: true };
+      }
+      contentType = (res.headers.get("content-type") ?? "").toLowerCase();
+      buf = Buffer.from(await res.arrayBuffer());
+    } catch (e) {
+      return { content: [{ type: "text", text: `download failed: ${e.message}` }], isError: true };
+    }
+
+    let ext =
+      (mediaUrl.match(/\.([a-z0-9]+)(?:\?|$)/i)?.[1] ?? "").toLowerCase() ||
+      (contentType.includes("gif") ? "gif"
+        : contentType.includes("mp4") ? "mp4"
+        : contentType.includes("webp") ? "webp"
+        : contentType.includes("png") ? "png"
+        : contentType.includes("jpeg") || contentType.includes("jpg") ? "jpg"
+        : "bin");
+    if (!/^(gif|mp4|webp|webm|png|jpe?g)$/i.test(ext)) ext = "gif";
+
+    const id = `g_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    mkdirSync(GIF_LIBRARY_DIR, { recursive: true });
+    const destPath = resolve(GIF_LIBRARY_DIR, `${id}-${niceName}.${ext}`);
+    try { writeFileSync(destPath, buf); }
+    catch (e) { return { content: [{ type: "text", text: `write failed: ${e.message}` }], isError: true }; }
+
+    const index = loadGifIndex();
+    index.push({
+      id, name: niceName, description, tags,
+      path: destPath, ext: `.${ext}`,
+      sourceUrl: url, resolvedUrl: mediaUrl,
+      bytes: buf.length, contentType,
+      addedAt: new Date().toISOString(),
+    });
+    saveGifIndex(index);
+    return {
+      content: [{
+        type: "text",
+        text: `ok — saved as ${id} (${buf.length} bytes, ${contentType || ext}) at ${destPath}`,
+      }],
+    };
+  }
+
+  if (name === "gif_list") {
+    const tag = args?.tag ? String(args.tag).toLowerCase() : null;
+    const gifs = loadGifIndex().filter((g) => !tag || g.tags?.includes(tag));
+    return { content: [{ type: "text", text: JSON.stringify(gifs, null, 2) }] };
+  }
+
+  if (name === "gif_search") {
+    const q = String(args?.query ?? "").toLowerCase().trim();
+    if (!q) return { content: [{ type: "text", text: "query is required" }], isError: true };
+    const hits = loadGifIndex().filter(
+      (g) =>
+        g.name?.toLowerCase().includes(q) ||
+        g.description?.toLowerCase().includes(q) ||
+        g.tags?.some((t) => t.includes(q)),
+    );
+    return { content: [{ type: "text", text: JSON.stringify(hits, null, 2) }] };
+  }
+
+  if (name === "gif_remove") {
+    const id = String(args?.id ?? "");
+    const before = loadGifIndex();
+    const entry = before.find((g) => g.id === id);
+    if (!entry) return { content: [{ type: "text", text: `no gif with id ${id}` }], isError: true };
+    try { rmSync(entry.path, { force: true }); } catch { /* ignore */ }
+    saveGifIndex(before.filter((g) => g.id !== id));
+    return { content: [{ type: "text", text: `ok — removed ${id}` }] };
+  }
 
   if (name === "auto_respond_add") {
     const pattern = String(args?.pattern ?? "").trim();

@@ -1388,13 +1388,57 @@ server.registerTool(
           const u = m.user.username?.toLowerCase() ?? "";
           const d = (m.displayName ?? "").toLowerCase();
           const n = (m.nickname ?? "").toLowerCase();
-          if (u.includes(q) || d.includes(q) || n.includes(q)) {
-            out.push({ guildId: g.id, guildName: g.name, ...memberSummary(m) });
+          const gn = (m.user.globalName ?? "").toLowerCase();
+          if (u.includes(q) || d.includes(q) || n.includes(q) || gn.includes(q)) {
+            out.push({ guildId: g.id, guildName: g.name, ...memberSummary(m), globalName: m.user.globalName ?? null });
             if (out.length >= cap) return ok(out);
           }
         }
       }
       return ok(out);
+    } catch (e) { return err(e); }
+  }
+);
+
+server.registerTool(
+  "dump_members",
+  {
+    title: "Dump every member in every guild",
+    description:
+      "Brute-force fallback when find_member can't locate someone. Returns every cached member from every guild the bot is in, with id, username, globalName (Discord's new Display Name), guild nickname, guildId, guildName. Forces a full members.fetch() per guild first so cache is hot. Output can be large — pass guildId to scope to one server, or maxPerGuild to cap per guild.",
+    inputSchema: {
+      guildId: z.string().optional().describe("Limit to one guild."),
+      maxPerGuild: z.number().int().min(1).max(2000).optional().describe("Cap members returned per guild. Default unlimited."),
+    },
+  },
+  async ({ guildId, maxPerGuild }) => {
+    try {
+      await ready;
+      const cap = maxPerGuild ?? Infinity;
+      const out = [];
+      const guildList = guildId ? [await getGuild(guildId)] : await Promise.all(
+        [...(await client.guilds.fetch()).values()].map((p) => p.fetch().catch(() => null)),
+      );
+      for (const g of guildList) {
+        if (!g) continue;
+        try { await g.members.fetch(); } catch { /* skip */ }
+        let count = 0;
+        for (const [, m] of g.members.cache) {
+          if (count >= cap) break;
+          out.push({
+            guildId: g.id,
+            guildName: g.name,
+            id: m.id,
+            username: m.user.username,
+            globalName: m.user.globalName ?? null,
+            nickname: m.nickname ?? null,
+            displayName: m.displayName,
+            bot: m.user.bot,
+          });
+          count++;
+        }
+      }
+      return ok({ totalGuilds: guildList.filter(Boolean).length, totalMembers: out.length, members: out });
     } catch (e) { return err(e); }
   }
 );

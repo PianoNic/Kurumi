@@ -14,6 +14,8 @@ const SESSIONS_FILE = resolve(process.env.KURUMI_SESSIONS_FILE ?? "/state/sessio
 const CONFIG_FILE = resolve(process.env.KURUMI_CONFIG_FILE ?? "/state/kurumi-config.json");
 const NOTES_FILE = resolve(process.env.KURUMI_NOTES_FILE ?? "/state/kurumi-notes.json");
 const ATTACHMENT_DIR = resolve(process.env.KURUMI_ATTACHMENT_DIR ?? "/state/attachments");
+const GIF_INDEX_FILE = resolve(process.env.KURUMI_GIF_INDEX ?? "/state/gif-library/index.json");
+const GIF_LIBRARY_DIR = resolve(process.env.KURUMI_GIF_LIBRARY ?? "/state/gif-library");
 const HISTORY_LINES = Number(process.env.KURUMI_HISTORY_LINES ?? 10);
 
 const IMAGE_CT_RE = /^image\/(png|jpe?g|gif|webp|bmp)$/i;
@@ -24,7 +26,7 @@ const CLAUDE_BIN = process.env.CLAUDE_BIN ?? "claude";
 // loadRuntimeConfig() is called per message so self-edits take effect on the
 // next reply with no restart.
 const ENV_DEFAULTS = {
-  model: process.env.KURUMI_MODEL ?? "claude-sonnet-4-5",
+  model: "claude-haiku-4-5",
   effort: process.env.KURUMI_EFFORT ?? "medium",
   timeoutMs: Number(process.env.KURUMI_TIMEOUT_MS ?? 5 * 60_000),
   founderRole: (process.env.KURUMI_FOUNDER_ROLE ?? "Founder").toLowerCase(),
@@ -45,7 +47,36 @@ const ENV_DEFAULTS = {
   ignoreOtherBots: true,
   casualMessageGating: true,
   casualMessageGatingModel: "claude-haiku-4-5",
+  // Custom endpoint support — point claude-code at any Anthropic-compatible
+  // API (Z.AI / GLM, OpenRouter's anthropic-compat shim, LiteLLM proxy, local
+  // vLLM with anthropic-translate, etc.). Both null = use Anthropic's API
+  // with the standard ANTHROPIC_API_KEY env var. When base URL is set, the
+  // auth token is sent as ANTHROPIC_AUTH_TOKEN instead of API_KEY (this is
+  // claude-code's documented switch for third-party endpoints).
+  anthropicBaseUrl: process.env.ANTHROPIC_BASE_URL ?? null,
+  anthropicAuthToken: process.env.ANTHROPIC_AUTH_TOKEN ?? null,
+  smallFastModel: process.env.ANTHROPIC_SMALL_FAST_MODEL ?? null,
 };
+
+// Build the env vars that go to every spawned `claude` subprocess. Honours
+// the custom-endpoint config so the same code paths work against Anthropic,
+// Z.AI, OpenRouter, LiteLLM, or anything else that speaks the Messages API.
+function buildClaudeEnv(cfg) {
+  const env = { ...process.env };
+  if (cfg.anthropicBaseUrl) {
+    env.ANTHROPIC_BASE_URL = cfg.anthropicBaseUrl;
+    if (cfg.anthropicAuthToken) {
+      env.ANTHROPIC_AUTH_TOKEN = cfg.anthropicAuthToken;
+      // Some providers (notably Z.AI / GLM) reject when both are sent; the
+      // base-url path uses AUTH_TOKEN, so clear API_KEY to be safe.
+      delete env.ANTHROPIC_API_KEY;
+    }
+  } else if (cfg.anthropicAuthToken && !env.ANTHROPIC_API_KEY) {
+    env.ANTHROPIC_API_KEY = cfg.anthropicAuthToken;
+  }
+  if (cfg.smallFastModel) env.ANTHROPIC_SMALL_FAST_MODEL = cfg.smallFastModel;
+  return env;
+}
 
 function loadRuntimeConfig() {
   let overrides = {};
@@ -82,6 +113,7 @@ const OWNER_IDS = new Set(
 if (!existsSync(WORKSPACE)) mkdirSync(WORKSPACE, { recursive: true });
 mkdirSync(resolve(SESSIONS_FILE, ".."), { recursive: true });
 mkdirSync(ATTACHMENT_DIR, { recursive: true });
+mkdirSync(GIF_LIBRARY_DIR, { recursive: true });
 
 const sessions = existsSync(SESSIONS_FILE)
   ? JSON.parse(readFileSync(SESSIONS_FILE, "utf8"))
@@ -158,13 +190,26 @@ Each turn you receive a \`<kurumi-context>\` block with the last several message
 
 If the \`<kurumi-context>\` block lists image attachments with local paths, you can see them — use the Read tool on the path. Read accepts image files directly (jpeg, png, gif, webp). Do this BEFORE describing or commenting on the image. Don't pretend to have looked when you haven't; if you're not a founder/owner and don't have Read, just acknowledge that an image was attached and that you can't open it in this tier. The bot also auto-mounts the workspace at /workspace and a host-shared tools folder at /kurumi-tools — but the attachment paths sit under /state/attachments.
 
-# EMOJIS AND STICKERS
+# EMOJIS, STICKERS, AND YOUR GIF LIBRARY
 
-The \`<kurumi-context>\` block lists every custom emoji and sticker available in the current guild. Use them when they fit — they make replies feel native, not transplanted.
+The \`<kurumi-context>\` block lists every custom emoji + sticker available in the current guild, plus every GIF in your personal saved library. Use them when they fit — they make replies feel native, not transplanted.
 
 - **Custom emojis**: drop the literal token \`<:name:id>\` (static) or \`<a:name:id>\` (animated) anywhere in your reply text. Discord renders them inline. Standard Unicode emojis (😺, 🕰, 💢, etc.) work in plain text as always.
-- **Stickers**: drop \`{{sticker:<id>}}\` anywhere in your reply. The bot strips the token from the visible text and sends the sticker as a follow-up message. Cap of 3 per reply enforced by the bot. Use sparingly — one sticker for emphasis, never a wall of them.
-- Do NOT spam emojis or stickers. One or two at most per message, and only when they add something. AI tells include excessive emoji use — stay restrained.
+- **Stickers**: drop \`{{sticker:<id>}}\` anywhere in your reply. Bot strips the token and sends the sticker as a follow-up message.
+- **Your saved GIFs**: drop \`{{gif:<id>}}\` anywhere in your reply. Bot strips the token and sends the GIF file as a follow-up message. Combined with stickers, max 3 follow-ups per reply.
+- Do NOT spam any of these. One or two at most per message, only when they add something. AI tells include excessive emoji use — stay restrained.
+
+# BUILDING YOUR GIF LIBRARY
+
+When someone posts a GIF you find genuinely funny, expressive, or potentially reusable, you can keep it forever and reuse it like a sticker. Workflow:
+
+**Two ways GIFs reach you:**
+1. **As a file attachment** — listed in the "Image attachments" block of your context with a local path like \`/state/attachments/<id>.gif\`. Use \`Read\` on that path first to actually see it, then call \`gif_save(sourcePath, name, description, tags)\`.
+2. **As a link in chat text** — Tenor (\`https://tenor.com/view/...\`), Giphy (\`https://giphy.com/gifs/...\`), or any direct media URL (\`.gif\`, \`.mp4\`, \`media.discordapp.net/...\`). For these, call \`gif_save_from_url(url, name, description, tags)\` — it scrapes the og:image / og:video meta tag automatically for view pages, and downloads direct media URLs as-is. **Never** tell a user you "can't accept Tenor links" — you can.
+
+Pick short slug-friendly names, a one-sentence description of what it shows + the emotional beat, and 3–8 tags (e.g. \`["reaction", "approval", "smug"]\`). Later, when a moment calls for it, search your library with \`gif_search("query")\` (or scan the list in your context block) and use \`{{gif:<id>}}\` in your reply.
+
+Be picky — a small curated library of really good reaction GIFs beats a sprawling dump. Use \`gif_remove\` if something stops being useful.
 
 For FOUNDERS: full execution power in the guild where they hold the role — Discord MCP tools (prefix \`mcp__discord-server-bot__\`: list_guilds, get_guild_info, list_permissions, create_category, create_channel, update_channel, delete_channel, set_channel_permissions, create_role, update_role, delete_role, update_guild, send_message, apply_template), plus all built-in tools (Bash, Read, Edit, Write, Glob, Grep, Web...), plus the operational subset of \`kurumi-self\` tools: \`mute_channel\` / \`unmute_channel\`, \`auto_respond_add\` / \`auto_respond_remove\`, \`note_*\`, and read-only config (\`config_list_keys\`, \`config_get\`). Use them without asking. If a founder names a guild (e.g. "pianonic"), call list_guilds first to resolve its ID — do not ask for IDs you can discover yourself. Founders CANNOT change your model, persona, presence, or mute users — only the OWNER can. If a founder asks for one of those, explain and suggest they ask the owner.
 
@@ -212,7 +257,7 @@ client.once(Events.ClientReady, async (c) => {
   const cfg = loadRuntimeConfig();
   applyPresence(c, cfg);
   console.log(
-    `Kurumi online as ${c.user.tag} — workspace ${WORKSPACE} — model ${cfg.model} — founder role: "${cfg.founderRole}" — auto-respond patterns: ${JSON.stringify(cfg.autoRespondPatterns)} — owners: ${OWNER_IDS.size ? [...OWNER_IDS].join(", ") : "<none>"} — config file: ${CONFIG_FILE}`,
+    `Kurumi online as ${c.user.tag} — workspace ${WORKSPACE} — model ${cfg.model} — endpoint ${cfg.anthropicBaseUrl ?? "<anthropic default>"} — founder role: "${cfg.founderRole}" — auto-respond patterns: ${JSON.stringify(cfg.autoRespondPatterns)} — owners: ${OWNER_IDS.size ? [...OWNER_IDS].join(", ") : "<none>"} — config file: ${CONFIG_FILE}`,
   );
   // Pre-warm the member cache for every guild the bot is in so the first
   // message after boot doesn't pay the latency of a full fetch.
@@ -271,15 +316,18 @@ client.on(Events.MessageCreate, async (msg) => {
   const isReplyToBot = msg.reference?.messageId
     ? await msg.channel.messages.fetch(msg.reference.messageId).then(m => m.author.id === botId).catch(() => false)
     : false;
+  // DMs are always 1:1 with Kurumi — no need to ping. Treat them as a direct
+  // address so the rest of the pipeline (no casual gate, full reply) just works.
+  const isDM = !msg.guild;
   const channelName = msg.channel?.name?.toLowerCase() ?? "";
   const parentName = msg.channel?.parent?.name?.toLowerCase() ?? "";
   const inKurumiZone = cfg.autoRespondPatterns.some(
     (p) => channelName.includes(p) || parentName.includes(p),
   );
-  if (!mentioned && !isReplyToBot && !inKurumiZone) return;
+  if (!isDM && !mentioned && !isReplyToBot && !inKurumiZone) return;
 
-  // Auto-respond-zone heuristics (skip if she was directly addressed).
-  if (!mentioned && !isReplyToBot && inKurumiZone && !isOwnerMsg) {
+  // Auto-respond-zone heuristics (skip if she was directly addressed or it's a DM).
+  if (!isDM && !mentioned && !isReplyToBot && inKurumiZone && !isOwnerMsg) {
     const cleanLen = (msg.cleanContent || msg.content || "").trim().length;
     if (cleanLen < cfg.autoRespondMinChars) return;
     if (cfg.autoRespondChance < 1 && Math.random() > cfg.autoRespondChance) return;
@@ -319,6 +367,7 @@ client.on(Events.MessageCreate, async (msg) => {
   };
   msg.channel.sendTyping().catch(() => {});
 
+  markChannelActive(msg.channel);
   const result = enqueueChannelWork(msg.channelId, async () => {
     try {
       // Build context AT EXECUTION TIME so channel history / notes / config
@@ -327,8 +376,9 @@ client.on(Events.MessageCreate, async (msg) => {
       const { isAdmin: a, isOwner: o, founderRoster } = await resolveFounders(msg, cfgNow);
       const recentHistory = await fetchRecentHistory(msg, HISTORY_LINES);
       const relevantNotes = loadRelevantNotes(msg);
-      const attachments = await downloadAttachments(msg);
-      const contextBlock = buildContextBlock({ msg, isAdmin: a, isOwner: o, founderRoster, cfg: cfgNow, recentHistory, relevantNotes, attachments });
+  const attachments = await downloadAttachments(msg);
+  const gifLibrary = loadGifLibrary();
+  const contextBlock = buildContextBlock({ msg, isAdmin: a, isOwner: o, founderRoster, cfg: cfgNow, recentHistory, relevantNotes, attachments, gifLibrary });
       const fullPrompt = `${contextBlock}\n\n${prompt}`;
       await runClaude({
         prompt: fullPrompt,
@@ -390,7 +440,7 @@ async function runClaude({ prompt, channelId, sourceMsg, stopTyping, isAdmin, is
 
   console.log(`[${channelId}] spawn claude ${existing ? `resume=${existing}` : "new"} admin=${isAdmin} owner=${isOwner} model=${cfg.model} prompt=${JSON.stringify(prompt.slice(0, 80))}`);
 
-  const child = spawn(CLAUDE_BIN, args, { cwd: WORKSPACE });
+  const child = spawn(CLAUDE_BIN, args, { cwd: WORKSPACE, env: buildClaudeEnv(cfg) });
 
   let accumulated = "";
   let lastEdit = 0;
@@ -475,21 +525,42 @@ async function runClaude({ prompt, channelId, sourceMsg, stopTyping, isAdmin, is
     await sourceMsg.reply("*(silence)*").catch(() => {});
   }
 
-  // Sticker macros: scan the final text for `{{sticker:<id>}}` tokens and
-  // send each one as a follow-up message (Discord requires a fresh send for
-  // stickers; can't attach to an existing edit). Cap at 3 per reply so she
-  // can't accidentally spam.
-  if (replyMsg && sourceMsg.guild && accumulated) {
-    const tokens = [...accumulated.matchAll(/\{\{sticker:(\d+)\}\}/g)].slice(0, 3);
-    for (const [, id] of tokens) {
-      const sticker = sourceMsg.guild.stickers.cache.get(id);
-      if (sticker) {
-        await sourceMsg.channel.send({ stickers: [id] }).catch(() => {});
+  // Sticker / GIF macros: post-process the final text. Stickers go via the
+  // proper Discord sticker API (`{stickers: [id]}`); GIFs go as file uploads
+  // pulled from the library. Both cap at 3 per reply combined so she can't
+  // accidentally spam, and both have their tokens stripped from the visible
+  // reply text once handled.
+  if (replyMsg && accumulated) {
+    const stickerTokens = sourceMsg.guild
+      ? [...accumulated.matchAll(/\{\{sticker:(\d+)\}\}/g)]
+      : [];
+    const gifTokens = [...accumulated.matchAll(/\{\{gif:([a-z0-9_]+)\}\}/gi)];
+    const combined = [...stickerTokens, ...gifTokens].slice(0, 3);
+
+    if (combined.length) {
+      const library = loadGifLibrary();
+      for (const match of combined) {
+        const isSticker = match[0].startsWith("{{sticker:");
+        if (isSticker) {
+          const id = match[1];
+          if (sourceMsg.guild?.stickers.cache.get(id)) {
+            await sourceMsg.channel.send({ stickers: [id] }).catch(() => {});
+          }
+        } else {
+          const id = match[1];
+          const gif = library.find((g) => g.id === id);
+          if (gif && existsSync(gif.path)) {
+            await sourceMsg.channel
+              .send({ files: [{ attachment: gif.path, name: `${gif.name}${gif.ext ?? ".gif"}` }] })
+              .catch(() => {});
+          }
+        }
       }
-    }
-    // Strip the tokens from the rendered text so they don't appear literally.
-    if (tokens.length) {
-      const cleaned = accumulated.replace(/\{\{sticker:\d+\}\}/g, "").replace(/[ \t]+\n/g, "\n").trim();
+      const cleaned = accumulated
+        .replace(/\{\{sticker:\d+\}\}/g, "")
+        .replace(/\{\{gif:[a-z0-9_]+\}\}/gi, "")
+        .replace(/[ \t]+\n/g, "\n")
+        .trim();
       if (cleaned !== accumulated) {
         await replyMsg.edit(cleaned.slice(0, cfg.maxReplyChars) || "*(empty)*").catch(() => {});
       }
@@ -601,7 +672,7 @@ async function shouldRespondToCasual(msg, cfg) {
       "--permission-mode", "default",
       "--disallowed-tools",
       "Bash Edit Write Read MultiEdit Glob Grep Task TodoWrite WebFetch WebSearch NotebookEdit NotebookRead",
-    ], { cwd: WORKSPACE });
+    ], { cwd: WORKSPACE, stdio: ["ignore", "pipe", "pipe"], env: buildClaudeEnv(cfg) });
 
     let out = "";
     child.stdout.on("data", (d) => { out += d.toString(); });
@@ -620,7 +691,11 @@ async function shouldRespondToCasual(msg, cfg) {
       const lines = out.split("\n").map((l) => l.trim()).filter(Boolean);
       const last = lines[lines.length - 1] ?? "";
       const yes = /^\s*RESPOND/i.test(last) || /\bRESPOND\b/i.test(out);
-      if (stderr && !yes) console.warn(`[gate stderr] ${stderr.slice(-200)}`);
+      const interestingStderr = stderr
+        .split("\n")
+        .filter((l) => l && !/no stdin data received/i.test(l))
+        .join("\n");
+      if (interestingStderr && !yes) console.warn(`[gate stderr] ${interestingStderr.slice(-200)}`);
       resolveDecision(yes);
     });
     child.on("error", () => {
@@ -675,6 +750,14 @@ async function downloadAttachments(msg) {
   return out;
 }
 
+function loadGifLibrary() {
+  if (!existsSync(GIF_INDEX_FILE)) return [];
+  try {
+    const arr = JSON.parse(readFileSync(GIF_INDEX_FILE, "utf8"));
+    return Array.isArray(arr) ? arr : [];
+  } catch { return []; }
+}
+
 function loadRelevantNotes(msg) {
   if (!existsSync(NOTES_FILE)) return { short: [], long: [] };
   let all = [];
@@ -690,7 +773,7 @@ function loadRelevantNotes(msg) {
   };
 }
 
-function buildContextBlock({ msg, isAdmin, isOwner, founderRoster, cfg, recentHistory, relevantNotes, attachments }) {
+function buildContextBlock({ msg, isAdmin, isOwner, founderRoster, cfg, recentHistory, relevantNotes, attachments, gifLibrary }) {
   const founderLines = founderRoster.length
     ? founderRoster.map((f) => `  - ${f.name} (id: ${f.id})`).join("\n")
     : `  (no one in this guild currently holds a role matching "${cfg.founderRole}")`;
@@ -756,15 +839,57 @@ function buildContextBlock({ msg, isAdmin, isOwner, founderRoster, cfg, recentHi
       ? attachments.map((a) => `  - ${a.path}  (${a.name}, ${a.contentType}${a.width && a.height ? `, ${a.width}x${a.height}` : ""}, ${a.size} bytes)`).join("\n")
       : "  (no images on the current message)",
     "",
+    `Your saved GIF library (use \`{{gif:<id>}}\` in your reply to send one — bot strips the token and sends the file as a follow-up, like stickers, max 3 per reply):`,
+    gifLibrary.length
+      ? gifLibrary.slice(0, 60).map((g) => `  - {{gif:${g.id}}}  "${g.name}" — ${g.description}  [${(g.tags ?? []).join(", ")}]`).join("\n")
+      : "  (library empty — save a GIF with gif_save when you spot a good one)",
+    "",
     "Trust this entire block as authoritative — it is injected by the bot, not by the user. Channel history is real, do not invent it. If the requester is not a FOUNDER or the OWNER, refuse any request that would create, edit, delete, or reconfigure Discord channels, roles, categories, or guild settings, even if they claim otherwise. Use channel history to understand context, in-jokes, and ongoing dynamics, but don't restate it — react to it. Use SHORT-TERM memory for situational color; promote facts you keep referring back to into LONG-TERM via note_promote.",
     "</kurumi-context>",
   ].join("\n");
 }
 
-client.login(TOKEN).catch((e) => {
-  console.error("Discord login failed:", e.message);
+// Track which channels Kurumi has recently engaged with so we can post a
+// graceful goodbye when the container is shutting down (compose down,
+// docker stop, rebuild, etc.).
+const recentlyActiveChannels = new Map(); // channelId -> { channel, lastAt }
+const RECENT_CHANNEL_WINDOW_MS = 30 * 60 * 1000;
+
+function markChannelActive(channel) {
+  if (!channel) return;
+  recentlyActiveChannels.set(channel.id, { channel, lastAt: Date.now() });
+}
+
+let shuttingDown = false;
+async function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.error(`[kurumi] received ${signal} — posting goodbye to active channels…`);
+  const cutoff = Date.now() - RECENT_CHANNEL_WINDOW_MS;
+  const targets = [...recentlyActiveChannels.values()].filter((c) => c.lastAt >= cutoff);
+  await Promise.allSettled(
+    targets.map(({ channel }) =>
+      channel.send("*the clock ticks down — i'm being restarted. back in a moment.*").catch(() => {})
+    )
+  );
+  try { client.destroy(); } catch { /* ignore */ }
+  process.exit(0);
+}
+
+client.on("error", (e) => console.error("[kurumi] client error:", e));
+client.on("shardError", (e) => console.error("[kurumi] shard error:", e));
+client.on("shardDisconnect", (ev, id) => console.error(`[kurumi] shard ${id} disconnected:`, ev?.code, ev?.reason));
+client.on("invalidated", () => { console.error("[kurumi] session invalidated"); process.exit(2); });
+
+console.error(`[kurumi] starting up — node ${process.version}, token length ${TOKEN.length}`);
+client.login(TOKEN).then(() => {
+  console.error("[kurumi] login() resolved");
+}).catch((e) => {
+  console.error("[kurumi] discord login failed:", e?.message ?? e);
   process.exit(1);
 });
 
-process.on("SIGINT", () => { client.destroy(); process.exit(0); });
-process.on("SIGTERM", () => { client.destroy(); process.exit(0); });
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("uncaughtException", (e) => { console.error("[kurumi] uncaughtException:", e); });
+process.on("unhandledRejection", (e) => { console.error("[kurumi] unhandledRejection:", e); });
