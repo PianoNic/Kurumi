@@ -64,6 +64,10 @@ services:
       - claude-config:/root/.claude
       - ./kurumi-workspace:/workspace
       - kurumi-state:/state
+      # Kurumi's personal tools folder — persistent across rebuilds, host-
+      # editable. She can install npm packages, write scripts, build her own
+      # MCP servers here. Bind-mounted so the owner can also poke at it.
+      - ./kurumi-tools:/kurumi-tools
 
   agent-sdk:
     build:
