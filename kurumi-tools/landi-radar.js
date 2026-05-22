@@ -20,8 +20,33 @@ if (fs.existsSync(CACHE_FILE)) {
 }
 
 (async () => {
+    // Try multiple browser paths in order of preference
+    const browserPaths = [
+        '/usr/bin/chromium',
+        '/usr/bin/chromium-browser',
+        '/usr/bin/google-chrome',
+        '/usr/bin/google-chrome-stable',
+        '/snap/bin/chromium'
+    ];
+
+    let executablePath = null;
+    for (const path of browserPaths) {
+        try {
+            require('fs').accessSync(path);
+            executablePath = path;
+            break;
+        } catch (e) {
+            // Path doesn't exist, try next
+        }
+    }
+
+    if (!executablePath) {
+        console.error('No suitable browser found. Install chromium or google-chrome-stable.');
+        process.exit(1);
+    }
+
     const browser = await puppeteer.launch({
-        executablePath: '/usr/bin/chromium',
+        executablePath: executablePath,
         headless: true,
         args: ['--no-sandbox', '--disable-setuid-sandbox']
     });
@@ -37,12 +62,15 @@ if (fs.existsSync(CACHE_FILE)) {
             timeout: 15000
         });
 
-        // Wait for radar to load
-        await page.waitForSelector('[data-testid="radar-container"], .radar, iframe', {
-            timeout: 10000
-        }).catch(() => {
-            console.warn('Radar container not found, proceeding anyway');
-        });
+        // Aggressively remove cookie dialog and overlays
+        await page.evaluate(() => {
+            document.querySelectorAll('[role="dialog"], [class*="cookie"], [id*="consent"], [class*="consent"], div[style*="position: fixed"]').forEach(el => {
+                el.remove();
+            });
+            document.body.style.overflow = 'auto';
+        }).catch(() => {});
+
+        await new Promise(r => setTimeout(r, 1000));
 
         // Capture screenshot
         await page.screenshot({ path: IMAGE_FILE, fullPage: false });

@@ -60,6 +60,10 @@ services:
       # Claude Code refuses to run as root unless IS_SANDBOX=1 is set. Containers
       # run as root by default, so flip the flag.
       IS_SANDBOX: "1"
+      # Optional: pass a GitHub PAT through to the container so Kurumi can use
+      # `gh` non-interactively (gh reads GH_TOKEN by default). Put GH_TOKEN in
+      # kurumi-chat-bot/.env if you want her to authenticate to GitHub.
+      GH_TOKEN: ${GH_TOKEN:-}
     volumes:
       - claude-config:/root/.claude
       - ./kurumi-workspace:/workspace

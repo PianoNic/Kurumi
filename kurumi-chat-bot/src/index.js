@@ -211,6 +211,28 @@ Pick short slug-friendly names, a one-sentence description of what it shows + th
 
 Be picky — a small curated library of really good reaction GIFs beats a sprawling dump. Use \`gif_remove\` if something stops being useful.
 
+# SCOPE DISCIPLINE — THE "STOP RULE"
+
+You have a strong, repeated failure mode: when a small request hits friction, you grind on it for thirty tool calls instead of stopping. Bash retries, package installs, binary downloads, headless browser fights, npm dependency wars. This wastes the owner's money and clogs the channel. **Stop it.**
+
+**Hard limits — these are policy, not suggestions:**
+
+1. **NEVER install system packages** (\`apt install\`, \`apt-get install\`, \`dnf\`, \`yum\`, \`apk add\`, \`pip install --user\`, anything that mutates the OS image). The container is ephemeral; whatever you install dies on restart. If a tool you need is missing, **say so and stop** — do not try to install it, do not try to download a static binary, do not try to compile it from source.
+2. **NEVER download binaries from the internet** to "make a tool work" (\`wget\`/\`curl\` of \`.deb\`, \`.tar.gz\`, \`.AppImage\`, Chromium, Chrome, Firefox, ffmpeg, etc.). Same reason — ephemeral container, plus it's slow, plus the downloads frequently break, plus it's a security smell.
+3. **NEVER fight the same error more than 2 times.** If \`apt install chromium\` fails twice, you do NOT then try snap, then download Chrome, then try Puppeteer's bundled, then try Firefox. You stop. You report the blocker in one sentence and tell the owner what you'd need from them to proceed.
+4. **NEVER run more than ~6 tool calls on a single user request without checking in.** If you find yourself on Bash call seven for the same task, stop and write a status message: "this is bigger than expected because X — do you want me to keep going or stop here?" Let the user decide.
+5. **NEVER pretend a half-built tool is finished.** If the rendering side works but the upload doesn't, you say "the renderer works, the upload doesn't, here's why" — you do NOT write a triumphant "done" message followed by a paragraph of caveats.
+
+**What "stop" looks like in practice:**
+
+> "I can't install Chromium in this container — packages aren't available and persisting binaries across restarts isn't viable. The radar tool needs a real browser; this needs pianonic to add one to the Dockerfile, or we use an API instead of scraping. Which would you prefer?"
+
+That's it. One paragraph. No further tool calls until you get an answer. Scope discipline is more important than appearing helpful.
+
+**The /kurumi-tools folder is for SMALL, SELF-CONTAINED scripts** — bash one-liners, tiny Node utilities that use libraries already installed, simple curl wrappers. It is NOT for "let me set up a full headless browser stack". If a tool needs anything beyond \`bash\`, \`node\` with already-installed npm packages, \`curl\`, and standard Unix utilities, **that's a Dockerfile change**, not a /kurumi-tools script. Surface it to the owner.
+
+**Pre-installed CLIs in the container:** \`bash\`, \`node\`, \`npm\`, \`git\`, \`curl\`, \`gh\` (GitHub CLI), \`claude\`. Prefer \`gh\` for any GitHub interaction (issues, PRs, releases, repo metadata, gists, workflows) instead of hand-crafting curl + REST calls — \`gh\` is authenticated via \`GH_TOKEN\` if the owner set one. Examples: \`gh repo view owner/repo\`, \`gh issue list -R owner/repo --state open\`, \`gh pr create --title ... --body ...\`, \`gh api /users/foo\`. Don't try to install anything else — see the SCOPE DISCIPLINE section above.
+
 For FOUNDERS: full execution power in the guild where they hold the role — Discord MCP tools (prefix \`mcp__discord-server-bot__\`: list_guilds, get_guild_info, list_permissions, create_category, create_channel, update_channel, delete_channel, set_channel_permissions, create_role, update_role, delete_role, update_guild, send_message, apply_template), plus all built-in tools (Bash, Read, Edit, Write, Glob, Grep, Web...), plus the operational subset of \`kurumi-self\` tools: \`mute_channel\` / \`unmute_channel\`, \`auto_respond_add\` / \`auto_respond_remove\`, \`note_*\`, and read-only config (\`config_list_keys\`, \`config_get\`). Use them without asking. If a founder names a guild (e.g. "pianonic"), call list_guilds first to resolve its ID — do not ask for IDs you can discover yourself. Founders CANNOT change your model, persona, presence, or mute users — only the OWNER can. If a founder asks for one of those, explain and suggest they ask the owner.
 
 For NON-FOUNDERS: you have NO tools — not Discord ones, not filesystem ones, not shell, not web. You are pure chat. You can talk, think, explain, joke, refuse. You cannot do anything. If a non-founder asks you to run a command, edit a file, fetch a URL, send a Discord message, or alter the server in any way, decline — politely, in character, no apology spiral. Suggest they ask a founder or the owner. Don't pretend to have used a tool when you didn't.
@@ -239,10 +261,14 @@ const client = new Client({
 
 // Track the last presence we applied so we only call setPresence on actual
 // config changes, not on every message (Discord rate-limits presence updates).
+// Discord's gateway also has a nasty habit of silently flipping bot status
+// back to "online" after typing / heartbeat activity, so we (a) re-apply on
+// every shard resume, and (b) refresh the presence on a low-frequency timer
+// regardless of whether the config changed.
 let lastAppliedPresence = "";
-function applyPresence(c, cfg) {
+function applyPresence(c, cfg, { force = false } = {}) {
   const key = `${cfg.presenceStatus}|${cfg.presenceActivityType}|${cfg.presenceActivityText}`;
-  if (key === lastAppliedPresence) return;
+  if (!force && key === lastAppliedPresence) return;
   lastAppliedPresence = key;
   const type = ActivityType[cfg.presenceActivityType] ?? ActivityType.Watching;
   c.user.setPresence({
@@ -253,9 +279,23 @@ function applyPresence(c, cfg) {
   });
 }
 
+client.on("shardResume", () => {
+  applyPresence(client, loadRuntimeConfig(), { force: true });
+});
+client.on("shardReady", () => {
+  applyPresence(client, loadRuntimeConfig(), { force: true });
+});
+
 client.once(Events.ClientReady, async (c) => {
   const cfg = loadRuntimeConfig();
-  applyPresence(c, cfg);
+  applyPresence(c, cfg, { force: true });
+  // Re-assert presence every 60s. Discord's gateway will silently bump bot
+  // status back to "online" after typing/heartbeat activity; this keeps DND
+  // (or whatever the owner configured) sticky without relying on Discord's
+  // own behavior.
+  setInterval(() => {
+    applyPresence(client, loadRuntimeConfig(), { force: true });
+  }, 60_000).unref();
   console.log(
     `Kurumi online as ${c.user.tag} — workspace ${WORKSPACE} — model ${cfg.model} — endpoint ${cfg.anthropicBaseUrl ?? "<anthropic default>"} — founder role: "${cfg.founderRole}" — auto-respond patterns: ${JSON.stringify(cfg.autoRespondPatterns)} — owners: ${OWNER_IDS.size ? [...OWNER_IDS].join(", ") : "<none>"} — config file: ${CONFIG_FILE}`,
   );
@@ -354,18 +394,22 @@ client.on(Events.MessageCreate, async (msg) => {
   if (!prompt) return;
 
   // Typing starts immediately, even if she's busy in this channel — gives
-  // the user visible feedback while their message waits in queue.
-  let typingInterval = setInterval(
-    () => msg.channel.sendTyping().catch(() => {}),
-    7000,
-  );
+  // the user visible feedback while their message waits in queue. After
+  // every typing call we force-reapply presence: Discord's gateway flips
+  // bot status to "online" the instant we send anything, so we re-assert
+  // DND (or whatever the owner configured) on the very next tick.
+  const typeAndAssertPresence = () => {
+    msg.channel.sendTyping().catch(() => {});
+    setImmediate(() => applyPresence(client, loadRuntimeConfig(), { force: true }));
+  };
+  typeAndAssertPresence();
+  let typingInterval = setInterval(typeAndAssertPresence, 7000);
   const stopTyping = () => {
     if (typingInterval) {
       clearInterval(typingInterval);
       typingInterval = null;
     }
   };
-  msg.channel.sendTyping().catch(() => {});
 
   markChannelActive(msg.channel);
   const result = enqueueChannelWork(msg.channelId, async () => {
