@@ -158,6 +158,23 @@ const SCHEMA = {
     description:
       "If true (default), Kurumi never replies to other bots. Set false to allow bot-to-bot dialogue (rare; usually a footgun).",
   },
+  casualMessageGating: {
+    type: z.boolean(),
+    description:
+      "When true (default), in auto-respond zones Kurumi runs a cheap secondary inference (model: casualMessageGatingModel) to decide whether each casual message is worth replying to. Lets her sit quietly through inter-user banter and only jump in when she'd actually add value. Disable to make her reply to every qualifying message in auto-respond zones.",
+  },
+  casualMessageGatingModel: {
+    type: z.enum([
+      "claude-haiku-4-5",
+      "claude-sonnet-4-5",
+      "claude-opus-4-5",
+      "sonnet",
+      "opus",
+      "haiku",
+    ]),
+    description:
+      "Model used for the should-I-respond decision in auto-respond zones. Defaults to haiku (cheap and fast). Switch to sonnet if she's making bad judgement calls.",
+  },
 };
 
 function loadConfig() {

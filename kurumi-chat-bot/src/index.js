@@ -43,6 +43,8 @@ const ENV_DEFAULTS = {
   autoRespondChance: 1,
   maxReplyChars: 1900,
   ignoreOtherBots: true,
+  casualMessageGating: true,
+  casualMessageGatingModel: "claude-haiku-4-5",
 };
 
 function loadRuntimeConfig() {
@@ -281,6 +283,15 @@ client.on(Events.MessageCreate, async (msg) => {
     const cleanLen = (msg.cleanContent || msg.content || "").trim().length;
     if (cleanLen < cfg.autoRespondMinChars) return;
     if (cfg.autoRespondChance < 1 && Math.random() > cfg.autoRespondChance) return;
+    // Cheap LLM gate: would she actually want to reply to this? Saves a full
+    // expensive inference (and saves channel noise) when the answer is "no".
+    if (cfg.casualMessageGating) {
+      const shouldReply = await shouldRespondToCasual(msg, cfg);
+      if (!shouldReply) {
+        console.log(`[${msg.channelId}] casual gate: SKIP — ${JSON.stringify((msg.cleanContent || msg.content || "").slice(0, 60))}`);
+        return;
+      }
+    }
   }
 
   // Cooldown (skip on @mention, reply, or owner).
@@ -555,6 +566,69 @@ function buildMcpConfigJson({ isOwner, isAdmin }) {
     };
   }
   return JSON.stringify({ mcpServers: servers });
+}
+
+async function shouldRespondToCasual(msg, cfg) {
+  // Build a tiny context — last few messages + the current one — and ask a
+  // cheap model whether Kurumi should chime in. We don't pass the full system
+  // prompt or any tools; this is a pure judgement call, not a real turn.
+  const history = await fetchRecentHistory(msg, 8);
+  const historyText = history.length
+    ? history.map((h) => `[${h.ts}] ${h.author}${h.isBot ? " (you, Kurumi)" : ""}: ${h.content}`).join("\n")
+    : "(no prior visible messages)";
+  const newLine = `[now] ${msg.author.username}: ${(msg.cleanContent || msg.content || "").slice(0, 400)}`;
+
+  const prompt = [
+    "You are Kurumi Tokisaki, observing a Discord channel where you sometimes chime in without being directly addressed. Decide whether to respond to the LATEST message based on the recent conversation.",
+    "",
+    "Recent conversation (oldest → newest):",
+    historyText,
+    newLine,
+    "",
+    "Respond with exactly ONE word:",
+    "- RESPOND if the latest message: addresses you directly, asks a question you could answer well, continues a conversation you were actively part of, mentions a topic where your input would add real value, is provocative toward you, or contains something you genuinely want to react to in character.",
+    "- SKIP if it: is casual back-and-forth between other people that doesn't involve you, low-content noise (\"lol\", \"xd\", single emojis, reactions), an inside joke between specific people that doesn't include you, or anything where your input would be unwanted, redundant, or noise.",
+    "",
+    "Default to SKIP when uncertain. Silence is better than chiming in unnecessarily — you are a presence, not a chatterbox.",
+    "",
+    "Your answer (one word, RESPOND or SKIP, nothing else):",
+  ].join("\n");
+
+  return await new Promise((resolveDecision) => {
+    const child = spawn(CLAUDE_BIN, [
+      "-p", prompt,
+      "--model", cfg.casualMessageGatingModel,
+      "--permission-mode", "default",
+      "--disallowed-tools",
+      "Bash Edit Write Read MultiEdit Glob Grep Task TodoWrite WebFetch WebSearch NotebookEdit NotebookRead",
+    ], { cwd: WORKSPACE });
+
+    let out = "";
+    child.stdout.on("data", (d) => { out += d.toString(); });
+    let stderr = "";
+    child.stderr.on("data", (d) => { stderr += d.toString(); });
+
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      // On timeout, lean SKIP — better to stay silent than to fire late.
+      resolveDecision(false);
+    }, 20_000);
+
+    child.on("close", () => {
+      clearTimeout(timer);
+      // Take the LAST non-empty line so trailing whitespace / debug noise doesn't fool us.
+      const lines = out.split("\n").map((l) => l.trim()).filter(Boolean);
+      const last = lines[lines.length - 1] ?? "";
+      const yes = /^\s*RESPOND/i.test(last) || /\bRESPOND\b/i.test(out);
+      if (stderr && !yes) console.warn(`[gate stderr] ${stderr.slice(-200)}`);
+      resolveDecision(yes);
+    });
+    child.on("error", () => {
+      clearTimeout(timer);
+      // On spawn error, lean RESPOND so the failure is visible rather than silent.
+      resolveDecision(true);
+    });
+  });
 }
 
 async function fetchRecentHistory(msg, limit) {
