@@ -436,6 +436,275 @@ server.registerTool(
 );
 
 server.registerTool(
+  "bulk_delete_channels",
+  {
+    title: "Bulk-delete channels",
+    description:
+      "Delete many channels at once. Either pass explicit `channelIds`, or use `nameContains` / `nameRegex` / `parentId` / `typesInclude` filters to match across the whole guild. ALWAYS run with `dryRun: true` first — this is the single most destructive tool in this server. Categories with children: their children are deleted first.",
+    inputSchema: {
+      guildId: z.string(),
+      channelIds: z.array(z.string()).optional().describe("Explicit list. Skips all filters."),
+      nameContains: z.string().optional().describe("Case-insensitive substring filter on channel name."),
+      nameRegex: z.string().optional().describe("JS regex (i flag) filter on channel name."),
+      parentId: z.string().optional().describe("Only delete channels under this category."),
+      typesInclude: z.array(z.number().int()).optional()
+        .describe("Discord ChannelType numbers to include (0=text,2=voice,4=category,5=announcement,10/11/12=thread,13=stage,15=forum). Default: all non-thread."),
+      dryRun: z.boolean().optional(),
+      reason: z.string().optional(),
+    },
+  },
+  async ({ guildId, channelIds, nameContains, nameRegex, parentId, typesInclude, dryRun, reason }) => {
+    try {
+      const g = await getGuild(guildId);
+      await g.channels.fetch();
+      let targets;
+      if (channelIds?.length) {
+        targets = channelIds.map((id) => g.channels.cache.get(id)).filter(Boolean);
+      } else {
+        const needle = nameContains?.toLowerCase() ?? null;
+        const re = nameRegex ? new RegExp(nameRegex, "i") : null;
+        const typeSet = typesInclude?.length ? new Set(typesInclude) : null;
+        targets = [...g.channels.cache.values()].filter((ch) => {
+          if (parentId && ch.parentId !== parentId) return false;
+          if (typeSet) { if (!typeSet.has(ch.type)) return false; }
+          else if ([10, 11, 12].includes(ch.type)) return false;
+          if (needle && !(ch.name ?? "").toLowerCase().includes(needle)) return false;
+          if (re && !re.test(ch.name ?? "")) return false;
+          return true;
+        });
+      }
+      if (dryRun) {
+        return ok({
+          dryRun: true,
+          matched: targets.length,
+          sample: targets.slice(0, 25).map((c) => ({ id: c.id, name: c.name, type: c.type, parentId: c.parentId })),
+        });
+      }
+      const categories = targets.filter((c) => c.type === 4);
+      const nonCategories = targets.filter((c) => c.type !== 4);
+      let deleted = 0; const failed = [];
+      for (const c of nonCategories) {
+        try { await c.delete(reason); deleted += 1; } catch (e) { failed.push({ id: c.id, error: e.message }); }
+      }
+      for (const c of categories) {
+        for (const [, child] of c.children?.cache ?? new Map()) {
+          try { await child.delete(reason); deleted += 1; } catch (e) { failed.push({ id: child.id, error: e.message }); }
+        }
+        try { await c.delete(reason); deleted += 1; } catch (e) { failed.push({ id: c.id, error: e.message }); }
+      }
+      return ok({ matched: targets.length, deleted, failed });
+    } catch (e) { return err(e); }
+  }
+);
+
+server.registerTool(
+  "bulk_delete_roles",
+  {
+    title: "Bulk-delete roles",
+    description:
+      "Delete many roles at once by explicit `roleIds` or by `nameContains` / `nameRegex` filter. Managed roles (bot/integration roles) and @everyone are always skipped. Run `dryRun: true` first.",
+    inputSchema: {
+      guildId: z.string(),
+      roleIds: z.array(z.string()).optional(),
+      nameContains: z.string().optional(),
+      nameRegex: z.string().optional(),
+      includeManaged: z.boolean().optional().describe("Default false. Set true to ALSO delete bot/integration-managed roles (almost always wrong)."),
+      dryRun: z.boolean().optional(),
+      reason: z.string().optional(),
+    },
+  },
+  async ({ guildId, roleIds, nameContains, nameRegex, includeManaged, dryRun, reason }) => {
+    try {
+      const g = await getGuild(guildId);
+      await g.roles.fetch();
+      let targets;
+      if (roleIds?.length) {
+        targets = roleIds.map((id) => g.roles.cache.get(id)).filter(Boolean);
+      } else {
+        const needle = nameContains?.toLowerCase() ?? null;
+        const re = nameRegex ? new RegExp(nameRegex, "i") : null;
+        targets = [...g.roles.cache.values()].filter((r) => {
+          if (r.id === g.id) return false;
+          if (!includeManaged && r.managed) return false;
+          if (needle && !r.name.toLowerCase().includes(needle)) return false;
+          if (re && !re.test(r.name)) return false;
+          return true;
+        });
+      }
+      if (dryRun) {
+        return ok({ dryRun: true, matched: targets.length, sample: targets.slice(0, 25).map((r) => ({ id: r.id, name: r.name, managed: r.managed })) });
+      }
+      let deleted = 0; const failed = [];
+      for (const r of targets) {
+        try { await r.delete(reason); deleted += 1; } catch (e) { failed.push({ id: r.id, error: e.message }); }
+      }
+      return ok({ matched: targets.length, deleted, failed });
+    } catch (e) { return err(e); }
+  }
+);
+
+server.registerTool(
+  "bulk_delete_invites",
+  {
+    title: "Bulk-delete invites",
+    description: "Revoke many invites at once. Either explicit `codes`, or `channelId` to revoke every invite for a channel, or omit both to revoke ALL invites in the guild. Run `dryRun: true` first.",
+    inputSchema: {
+      guildId: z.string(),
+      codes: z.array(z.string()).optional(),
+      channelId: z.string().optional(),
+      dryRun: z.boolean().optional(),
+      reason: z.string().optional(),
+    },
+  },
+  async ({ guildId, codes, channelId, dryRun, reason }) => {
+    try {
+      const g = await getGuild(guildId);
+      const all = await g.invites.fetch();
+      let targets = [...all.values()];
+      if (codes?.length) {
+        const set = new Set(codes);
+        targets = targets.filter((i) => set.has(i.code));
+      } else if (channelId) {
+        targets = targets.filter((i) => i.channelId === channelId);
+      }
+      if (dryRun) {
+        return ok({ dryRun: true, matched: targets.length, sample: targets.slice(0, 25).map((i) => ({ code: i.code, channelId: i.channelId, uses: i.uses })) });
+      }
+      let deleted = 0; const failed = [];
+      for (const inv of targets) {
+        try { await inv.delete(reason); deleted += 1; } catch (e) { failed.push({ code: inv.code, error: e.message }); }
+      }
+      return ok({ matched: targets.length, deleted, failed });
+    } catch (e) { return err(e); }
+  }
+);
+
+server.registerTool(
+  "bulk_delete_emojis",
+  {
+    title: "Bulk-delete emojis",
+    description: "Delete many custom emojis at once. Either explicit `emojiIds` or `nameContains` filter. Run `dryRun: true` first.",
+    inputSchema: {
+      guildId: z.string(),
+      emojiIds: z.array(z.string()).optional(),
+      nameContains: z.string().optional(),
+      dryRun: z.boolean().optional(),
+      reason: z.string().optional(),
+    },
+  },
+  async ({ guildId, emojiIds, nameContains, dryRun, reason }) => {
+    try {
+      const g = await getGuild(guildId);
+      await g.emojis.fetch();
+      let targets;
+      if (emojiIds?.length) {
+        targets = emojiIds.map((id) => g.emojis.cache.get(id)).filter(Boolean);
+      } else {
+        const needle = nameContains?.toLowerCase() ?? null;
+        targets = [...g.emojis.cache.values()].filter((e) => !needle || e.name.toLowerCase().includes(needle));
+      }
+      if (dryRun) {
+        return ok({ dryRun: true, matched: targets.length, sample: targets.slice(0, 25).map((e) => ({ id: e.id, name: e.name })) });
+      }
+      let deleted = 0; const failed = [];
+      for (const e of targets) {
+        try { await e.delete(reason); deleted += 1; } catch (err2) { failed.push({ id: e.id, error: err2.message }); }
+      }
+      return ok({ matched: targets.length, deleted, failed });
+    } catch (e) { return err(e); }
+  }
+);
+
+server.registerTool(
+  "bulk_delete_threads",
+  {
+    title: "Bulk-delete threads",
+    description: "Delete many threads in a channel or across the whole guild. Filters: `parentChannelId`, `nameContains`, `archivedOnly`. Run `dryRun: true` first.",
+    inputSchema: {
+      guildId: z.string(),
+      parentChannelId: z.string().optional(),
+      nameContains: z.string().optional(),
+      archivedOnly: z.boolean().optional(),
+      dryRun: z.boolean().optional(),
+      reason: z.string().optional(),
+    },
+  },
+  async ({ guildId, parentChannelId, nameContains, archivedOnly, dryRun, reason }) => {
+    try {
+      const g = await getGuild(guildId);
+      await g.channels.fetch();
+      const parents = parentChannelId
+        ? [g.channels.cache.get(parentChannelId)].filter(Boolean)
+        : [...g.channels.cache.values()].filter((c) => c.threads);
+      const needle = nameContains?.toLowerCase() ?? null;
+      const targets = [];
+      for (const p of parents) {
+        try {
+          const active = await p.threads.fetchActive();
+          for (const [, t] of active.threads) targets.push(t);
+          if (archivedOnly !== false) {
+            const arch = await p.threads.fetchArchived({ limit: 100 });
+            for (const [, t] of arch.threads) targets.push(t);
+          }
+        } catch { /* skip */ }
+      }
+      const filtered = targets.filter((t) => {
+        if (archivedOnly && !t.archived) return false;
+        if (needle && !t.name.toLowerCase().includes(needle)) return false;
+        return true;
+      });
+      if (dryRun) {
+        return ok({ dryRun: true, matched: filtered.length, sample: filtered.slice(0, 25).map((t) => ({ id: t.id, name: t.name, parentId: t.parentId, archived: t.archived })) });
+      }
+      let deleted = 0; const failed = [];
+      for (const t of filtered) {
+        try { await t.delete(reason); deleted += 1; } catch (e) { failed.push({ id: t.id, error: e.message }); }
+      }
+      return ok({ matched: filtered.length, deleted, failed });
+    } catch (e) { return err(e); }
+  }
+);
+
+server.registerTool(
+  "bulk_delete_webhooks",
+  {
+    title: "Bulk-delete webhooks",
+    description: "Delete many webhooks at once. Either explicit `webhookIds`, `channelId` to scope, or omit both for every webhook in the guild. Run `dryRun: true` first.",
+    inputSchema: {
+      guildId: z.string(),
+      webhookIds: z.array(z.string()).optional(),
+      channelId: z.string().optional(),
+      dryRun: z.boolean().optional(),
+      reason: z.string().optional(),
+    },
+  },
+  async ({ guildId, webhookIds, channelId, dryRun, reason }) => {
+    try {
+      const g = await getGuild(guildId);
+      let hooks;
+      if (channelId) {
+        const ch = await g.channels.fetch(channelId);
+        hooks = [...(await ch.fetchWebhooks()).values()];
+      } else {
+        hooks = [...(await g.fetchWebhooks()).values()];
+      }
+      if (webhookIds?.length) {
+        const set = new Set(webhookIds);
+        hooks = hooks.filter((h) => set.has(h.id));
+      }
+      if (dryRun) {
+        return ok({ dryRun: true, matched: hooks.length, sample: hooks.slice(0, 25).map((h) => ({ id: h.id, name: h.name, channelId: h.channelId })) });
+      }
+      let deleted = 0; const failed = [];
+      for (const h of hooks) {
+        try { await h.delete(reason); deleted += 1; } catch (e) { failed.push({ id: h.id, error: e.message }); }
+      }
+      return ok({ matched: hooks.length, deleted, failed });
+    } catch (e) { return err(e); }
+  }
+);
+
+server.registerTool(
   "delete_role",
   {
     title: "Delete a role",
@@ -689,6 +958,122 @@ server.registerTool(
       const ch = await g.channels.fetch(channelId);
       const deleted = await ch.bulkDelete(count ?? 50, true);
       return ok({ deleted: deleted.size });
+    } catch (e) { return err(e); }
+  }
+);
+
+server.registerTool(
+  "purge_messages",
+  {
+    title: "Purge messages with filters",
+    description:
+      "More powerful than bulk_delete_messages. Scans the channel's recent history, applies optional filters (authorIds, contentContains, contentRegex, botsOnly, humansOnly, olderThanDays, newerThanDays), and deletes every match up to `maxDeletes`. Messages ≤14 days old are bulk-deleted in batches of 100 (fast). Messages >14 days old are deleted individually (slower, rate-limited by Discord). Returns counts of scanned/matched/deleted. Set `dryRun: true` to preview matches without deleting — STRONGLY RECOMMENDED before any large purge.",
+    inputSchema: {
+      guildId: z.string(),
+      channelId: z.string(),
+      scanLimit: z.number().int().min(1).max(5000).optional()
+        .describe("How many recent messages to scan. Default 200."),
+      maxDeletes: z.number().int().min(1).max(2000).optional()
+        .describe("Stop after deleting this many. Default 100."),
+      authorIds: z.array(z.string()).optional()
+        .describe("Only delete messages from these user IDs."),
+      contentContains: z.string().optional()
+        .describe("Case-insensitive substring filter on message content."),
+      contentRegex: z.string().optional()
+        .describe("JS regex (with 'i' flag) filter on message content. Mutually exclusive with contentContains."),
+      botsOnly: z.boolean().optional(),
+      humansOnly: z.boolean().optional(),
+      olderThanDays: z.number().min(0).optional()
+        .describe("Only delete messages older than N days."),
+      newerThanDays: z.number().min(0).optional()
+        .describe("Only delete messages newer than N days."),
+      dryRun: z.boolean().optional()
+        .describe("Preview matches without deleting. Default false."),
+      reason: z.string().optional().describe("Audit log reason."),
+    },
+  },
+  async ({
+    guildId, channelId, scanLimit, maxDeletes,
+    authorIds, contentContains, contentRegex,
+    botsOnly, humansOnly, olderThanDays, newerThanDays,
+    dryRun, reason,
+  }) => {
+    try {
+      const g = await getGuild(guildId);
+      const ch = await g.channels.fetch(channelId);
+      if (!ch?.isTextBased?.()) return err(new Error("channel is not text-based"));
+
+      const scanCap = scanLimit ?? 200;
+      const delCap = maxDeletes ?? 100;
+      const authorSet = authorIds?.length ? new Set(authorIds) : null;
+      const regex = contentRegex ? new RegExp(contentRegex, "i") : null;
+      const needle = contentContains?.toLowerCase() ?? null;
+      const now = Date.now();
+      const olderThanMs = olderThanDays != null ? olderThanDays * 86_400_000 : null;
+      const newerThanMs = newerThanDays != null ? newerThanDays * 86_400_000 : null;
+      const fourteenDays = 14 * 86_400_000;
+
+      const matches = [];
+      let scanned = 0;
+      let before;
+      while (scanned < scanCap && matches.length < delCap) {
+        const batch = await ch.messages.fetch({ limit: Math.min(100, scanCap - scanned), before });
+        if (!batch.size) break;
+        for (const [, m] of batch) {
+          scanned++;
+          if (authorSet && !authorSet.has(m.author.id)) continue;
+          if (botsOnly && !m.author.bot) continue;
+          if (humansOnly && m.author.bot) continue;
+          if (needle && !(m.content ?? "").toLowerCase().includes(needle)) continue;
+          if (regex && !regex.test(m.content ?? "")) continue;
+          const age = now - m.createdTimestamp;
+          if (olderThanMs != null && age < olderThanMs) continue;
+          if (newerThanMs != null && age > newerThanMs) continue;
+          matches.push(m);
+          if (matches.length >= delCap) break;
+        }
+        before = batch.last()?.id;
+        if (batch.size < 100) break;
+      }
+
+      if (dryRun) {
+        return ok({
+          dryRun: true,
+          scanned,
+          matched: matches.length,
+          sample: matches.slice(0, 10).map((m) => ({
+            id: m.id, authorId: m.author.id, authorTag: m.author.tag,
+            createdAt: m.createdAt.toISOString(),
+            content: (m.content ?? "").slice(0, 120),
+          })),
+        });
+      }
+
+      const fresh = matches.filter((m) => now - m.createdTimestamp < fourteenDays);
+      const old = matches.filter((m) => now - m.createdTimestamp >= fourteenDays);
+
+      let deleted = 0;
+      for (let i = 0; i < fresh.length; i += 100) {
+        const slice = fresh.slice(i, i + 100);
+        if (slice.length === 1) {
+          await slice[0].delete().catch(() => {});
+          deleted += 1;
+        } else {
+          const res = await ch.bulkDelete(slice, true).catch(() => null);
+          deleted += res?.size ?? 0;
+        }
+      }
+      for (const m of old) {
+        try { await m.delete(reason); deleted += 1; } catch { /* skip */ }
+      }
+
+      return ok({
+        scanned,
+        matched: matches.length,
+        deleted,
+        bulkDeletedFresh: fresh.length,
+        individualDeletedOld: old.length,
+      });
     } catch (e) { return err(e); }
   }
 );
